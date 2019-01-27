@@ -34,74 +34,135 @@
 
 import re
 from datetime import datetime
+
 from scraperdb import Entity
+from reynir import Abbreviations
 
 
 MODULE_NAME = __name__
 
+# Avoid chaff
+NOT_DEFINITIONS = {
+    "við", "ári", "ár", "sæti", "stig", "færi", "var", "varð"
+    "fæddur", "fætt", "fædd",
+    "spurður", "spurt", "spurð",
+    "búinn", "búið", "búin",
+    "sá", "sú", "það", "lán", "inna",
+    "hjónin", "hjónanna"
+}
+
+NOT_ENTITIES = {
+    "þeir", "þær", "þau", "sú", "þá", "þar", "þetta", "þessi", "þessu",
+    "the", "to", "aðspurð", "aðspurður", "aðstaða", "aðstæður", "aftur",
+    "þarna", "því", "þó", "hver", "hverju", "hvers", "ekki"
+}
+
 
 def article_begin(state):
     """ Called at the beginning of article processing """
-
     session = state["session"] # Database session
     url = state["url"] # URL of the article being processed
     # Delete all existing entities for this article
     session.execute(Entity.table().delete().where(Entity.article_url == url))
+    # Create a name mapping dict for the article
+    state["names"] = dict() # Last name -> full name
+
 
 def article_end(state):
     """ Called at the end of article processing """
     pass
 
-# Avoid chaff
-NOT_DEFINITIONS = {
-    "við", "ári", "sæti", "stig", "færi", "var", "varð"
-    "fæddur", "fætt", "fædd",
-    "spurður", "spurt", "spurð",
-    "búinn", "búið", "búin",
-    "sá", "sú", "það"
-}
 
 def sentence(state, result):
     """ Called at the end of sentence processing """
 
+    if "entities" not in result:
+        # Nothing to do
+        return
+
     session = state["session"] # Database session
     url = state["url"] # URL of the article being processed
     authority = state["authority"] # Authority of the article being processed
+    names = state["names"] # Mapping of last names to full names
 
-    if "entities" in result:
-        # Entities were found
-        for entity, verb, definition in result.entities:
+    if "names" in result:
+        # Names were found: add to name mapping dict
+        for n in result.names:
+            a = n.split()
+            if len(a) > 2 and a[-2] in names:
+                # Delete next-to-last name,
+                # i.e. if we now have "Hillary Rodham Clinton", delete "Rodham->Hillary Rodham"
+                del names[a[-2]]
+            if len(a) > 1:
+                # Map "Clinton->Hillary Rodham Clinton"
+                names[a[-1]] = n
 
-            if len(entity) < 2 or len(definition) < 2:
-                # Avoid chaff
-                continue
+    # Process potential entities
+    for entity, verb, definition in result.entities:
 
-            # Cut off ending punctuation
-            while any(definition.endswith(p) for p in (" ,", " .", " :", " !", " ?")):
-                definition = definition[:-2]
+        # Cut off ending punctuation
+        while any(entity.endswith(p) for p in (" ,", " .", " :", " !", " ?")):
+            entity = entity[:-2]
 
-            def def_ok(definition):
-                """ Returns True if a definition meets basic sanity criteria """
-                if definition in NOT_DEFINITIONS:
-                    return False
-                # Check for a match with a number string, eventually followed by a % sign
-                if re.match(r'-?\d+(\.\d\d\d)*(,\d+)?%?$', definition):
-                    return False
-                return True
+        # Cut off ending punctuation
+        while any(definition.endswith(p) for p in (" ,", " .", " :", " !", " ?")):
+            definition = definition[:-2]
 
-            if def_ok(definition):
+        if len(entity) < 2 or len(definition) < 2:
+            # Avoid chaff
+            continue
 
-                print("Entity '{0}' {1} '{2}'".format(entity, verb, definition))
+        # Cut phrases off the front
+        for p in ("sem er ", "jafnframt er "):
+            if definition.startswith(p):
+                definition = definition[len(p):]
+                break
 
-                e = Entity(
-                    article_url = url,
-                    name = entity,
-                    verb = verb,
-                    definition = definition,
-                    authority = authority,
-                    timestamp = datetime.utcnow()
-                )
-                session.add(e)
+        def def_ok(definition):
+            """ Returns True if a definition meets basic sanity criteria """
+            if definition.lower() in NOT_DEFINITIONS:
+                return False
+            # Check for a match with a number string, eventually followed by a % sign
+            if re.match(r'-?\d+(\.\d\d\d)*(,\d+)?%?$', definition):
+                return False
+            return True
+
+        def name_ok(entity):
+            """ Returns True if an entity name meets basic sanity criteria """
+            if entity.lower() in NOT_ENTITIES or entity in Abbreviations.DICT:
+                # Don't redefine abbreviations
+                return False
+            # Entity names must start with an uppercase letter
+            return entity[0].isupper()
+
+        if def_ok(definition) and name_ok(entity):
+
+            if entity in names:
+                # Probably the last name of a longer-named entity:
+                # define the full name, not the last name
+                # (i.e. 'Clinton er forsetaframbjóðandi' ->
+                #   'Hillary Rodham Clinton er forsetaframbjóðandi')
+                # print("Mapping entity name '{0}' to full name '{1}'".format(entity, names[entity]))
+                entity = names[entity]
+
+            print("Entity '{0}' {1} '{2}'".format(entity, verb, definition))
+
+            e = Entity(
+                article_url = url,
+                name = entity,
+                verb = verb,
+                definition = definition,
+                authority = authority,
+                timestamp = datetime.utcnow()
+            )
+            session.add(e)
+
+
+def visit(state, node):
+    """ Determine whether to visit a particular node """
+    # We don't visit SetningSkilyrði or any of its children
+    # because we know any assertions in there are conditional
+    return not node.has_nt_base("SetningSkilyrði")
 
 
 # Below are functions that have names corresponding to grammar nonterminals.
@@ -113,6 +174,22 @@ def EfLiður(node, params, result):
     """ Ekki láta sérnafn lifa í gegn um eignarfallslið """
     result.del_attribs(('sérnafn', 'sérnafn_nom'))
     # Ekki breyta eignarfallsliðum í nefnifall
+    result._nominative = result._text
+
+
+def NlSérnafnEf(node, params, result):
+    # Ekki breyta eignarfallsliðum í nefnifall
+    result._nominative = result._text
+
+
+def OkkarFramhald(node, params, result):
+    # Ekki breyta eignarfallsliðum í nefnifall
+    # Þetta grípur 'einn okkar', 'hvorugur þeirra'
+    result._nominative = result._text
+
+
+def AtviksliðurEinkunn(node, params, result):
+    # Ekki breyta atviksliðum í nefnifall
     result._nominative = result._text
 
 
@@ -143,14 +220,27 @@ def Sérnafn(node, params, result):
     result.sérnafn = result._text
     result.sérnafn_nom = result._nominative
     result.sérnafn_eind_nom = result._nominative
+    result.names = { result._nominative }
+
+
+def Nafn(node, params, result):
+    """ Við viljum ekki láta laufið Nafn skilgreina nafn á einingu (entity) """
+    result.nafn_flag = True
 
 
 def SérnafnEðaManneskja(node, params, result):
-    """ Sérnafn eða mannsnafn """
-    result.sérnafn = result._text
-    result.sérnafn_nom = result._nominative
-    result.sérnafn_eind_nom = result._nominative
+    """ Sérnafn eða mannsnafn, eða flóknari nafnliður (Nafn) """
+    if "nafn_flag" in result:
+        # Flóknari nafnliður: notum hann ekki sem nafn á Entity
+        result.del_attribs(('sérnafn', 'sérnafn_nom', 'nafn_flag'))
+        return
+    if "sérnafn" not in result:
+        result.sérnafn = result._text
+        result.sérnafn_nom = result._nominative
+    if "sérnafn_eind_nom" not in result:
+        result.sérnafn_eind_nom = result._nominative
     result.eindir = [ result._nominative ] # Listar eru sameinaðir
+    result.names = { result._nominative }
 
 
 def Fyrirtæki(node, params, result):
@@ -167,14 +257,20 @@ def SvigaInnihaldFsRuna(node, params, result):
 
 def SvigaInnihald(node, params, result):
     if node.has_variant("et"):
-        tengiliður = result.find_child(nt_base = "Tengiliður")
+        tengiliður = result.find_child(nt_base = "Tilvísunarsetning")
         if tengiliður:
             # '...sem framleiðir álumgjörina fyrir iPhone'
             tengisetning = tengiliður.find_child(nt_base = "Tengisetning")
             if tengisetning:
-                setning_án_f = tengisetning.find_child(nt_base = "SetningÁnF")
+                setning_án_f = tengisetning.find_child(nt_base = "BeygingarliðurÁnF")
                 if setning_án_f:
                     skilgr = setning_án_f._text
+                    # Remove extraneous prefixes
+                    for s in ("í dag",):
+                        if skilgr.startswith(s + " "):
+                            # Skera framan af
+                            skilgr = skilgr[len(s) + 1:]
+                            break
                     sögn = None
                     for s in ("er", "var", "sé", "hefur verið", "væri", "hefði orðið", "verður"):
                         if skilgr.startswith(s + " "):
@@ -189,11 +285,14 @@ def SvigaInnihald(node, params, result):
         elif result.find_child(nt_base = "HreinYfirsetning") is not None:
             # Hrein yfirsetning: sleppa því að nota hana
             pass
-        elif result.find_child(nt_base = "FsRuna") is not None:
+        elif result.find_child(nt_base = "SvigaInnihaldFsRuna") is not None:
             # Forsetningaruna: sleppa því að nota hana
             pass
+        elif result.find_child(nt_base = "SvigaInnihaldNl") is not None:
+            # Nafnliður sem passar ekki við fall eða tölu: sleppa því að nota hann
+            pass
         else:
-            # Nl/fall/tala eða SvigaInnihaldNl
+            # Nl/fall/tala: OK
             result.sviga_innihald = result._nominative
 
 
@@ -201,8 +300,37 @@ def NlKjarni(node, params, result):
     result.del_attribs("sérnafn_eind_nom")
 
 
+def Skst(node, params, result):
+    """ Ekki láta 'fyrirtækið Apple-búðin' skila 'Apple er fyrirtæki' """
+    result.del_attribs("sérnafn")
+    result.del_attribs("sérnafn_nom")
+
+
 def NlEind(node, params, result):
     """ Ef sérnafn og sviga_innihald eru rétt undir NlEind þá er það skilgreining """
+
+    if len(params) == 2 and params[0].has_nt_base("NlStak") and params[1].has_nt_base("NlSkýring"):
+        # Ef skýring fylgir sérnafni þá sleppum við henni
+        if "sérnafn" in params[0]:
+            result.sérnafn = params[0].sérnafn
+            result.sérnafn_nom = params[0].sérnafn_nom
+        else:
+            # Gæti verið venjulegur nafnliður með upphafsstaf
+            sérnafn = params[0]._text
+            sérnafn_nom = params[0]._nominative
+
+            # Athuga hvort allir hlutar nafnsins séu með upphafsstaf
+            # Ef svo, túlka þá sem sérnafn
+            if all(part and part[0].isupper() for part in sérnafn.split()):
+                result.sérnafn = sérnafn
+                result.sérnafn_nom = sérnafn_nom
+                if "sérnafn_eind_nom" not in result:
+                    result.sérnafn_eind_nom = sérnafn_nom
+            else:
+                result.del_attribs(("sérnafn", "sérnafn_nom"))
+        # Drop the explanation, if any
+        result._nominative = params[0]._nominative
+        result._text = params[0]._text
 
     if "sérnafn_eind_nom" in result and "sviga_innihald" in result:
 
@@ -212,7 +340,6 @@ def NlEind(node, params, result):
 
         if definition:
 
-            print("SvigaInnihald: '{0}' er '{1}'".format(entity, definition))
             # Append to result list
             if "entities" not in result:
                 result.entities = []
@@ -242,6 +369,12 @@ def SamstættFall(node, params, result):
             if not part or not part[0].isupper():
                 return
 
+    # Bæta við nafnamengi
+    if "names" in result:
+        result.names.add(sérnafn_nom)
+    else:
+        result.names = { sérnafn_nom }
+
     # Find the noun terminal parameter
     p_no = result.find_child(t_base = "no")
 
@@ -261,8 +394,6 @@ def SamstættFall(node, params, result):
         # !!! TODO: þetta breytir of mörgu í nefnifall - á aðeins að hafa áhrif á hrein íslensk
         # !!! sérnöfn, þ.e. nafnorð sem finnast í BÍN
         entity = sérnafn_nom
-
-    print("Definite: '{0}' er '{1}'".format(entity, definition))
 
     # Append to result list
     if "entities" not in result:
@@ -310,7 +441,7 @@ def Setning(node, params, result):
 
         # print("Entity er {0}".format(entity))
 
-        fsliðir = result.all_children(nt_base = "FsAtv")
+        # fsliðir = result.all_children(nt_base = "FsAtv")
         sagnruna = result.find_child(nt_base = "SagnRuna")
 
         if not sagnruna:
@@ -337,7 +468,7 @@ def Setning(node, params, result):
 
         #print("Andlag er {0}".format(andlag._text))
 
-        print("Statement: '{0}' {2} '{1}'".format(entity, andlag._text, sagnorð._text))
+        # print("Statement: '{0}' {2} '{1}'".format(entity, andlag._text, sagnorð._text))
 
         # Append to result list
         if "entities" not in result:
@@ -348,4 +479,5 @@ def Setning(node, params, result):
     finally:
         # Ekki senda sérnöfn upp í tréð ef þau hafa ekki verið höndluð nú þegar
         result.del_attribs(('sérnafn', 'sérnafn_nom'))
+        result.del_attribs(("skilgreining", "eindir"))
 

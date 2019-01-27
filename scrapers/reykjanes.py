@@ -32,7 +32,6 @@ from sqlalchemy import desc as SqlDesc
 
 from .default import Metadata, ScrapeHelper
 
-
 MODULE_NAME = __name__
 
 
@@ -44,7 +43,8 @@ class Reykjanes_DB:
 
     """ Wrapper around the SQLAlchemy connection, engine and session """
 
-    DB_HOSTNAME = '127.0.0.1'
+    DB_HOSTNAME = os.environ.get('GREYNIR_DB_HOST', 'localhost')
+    DB_PORT = os.environ.get('GREYNIR_DB_PORT', '5432') # Default PostgreSQL port
 
     def __init__(self):
 
@@ -53,8 +53,8 @@ class Reykjanes_DB:
         # Assemble the right connection string for CPython/psycopg2 vs.
         # PyPy/psycopg2cffi, respectively
         is_pypy = platform.python_implementation() == "PyPy"
-        conn_str = 'postgresql+{0}://reynir:reynir@{1}/reykjanes' \
-            .format('psycopg2cffi' if is_pypy else 'psycopg2', self.DB_HOSTNAME)
+        conn_str = 'postgresql+{0}://reynir:reynir@{1}:{2}/reykjanes' \
+            .format('psycopg2cffi' if is_pypy else 'psycopg2', self.DB_HOSTNAME, self.DB_PORT)
         self._engine = create_engine(conn_str)
         # Create a Session class bound to this engine
         self._Session = sessionmaker(bind = self._engine)
@@ -153,6 +153,8 @@ class ReykjanesScraper(ScrapeHelper):
 
     """ Generic scraping helper base class """
 
+    _SENTIMENT_DICT = { -1 : "Neikvæð", 0 : "Hlutlaus", 1 : "Jákvæð" }
+
     def __init__(self, root):
         super().__init__(root)
 
@@ -163,10 +165,21 @@ class ReykjanesScraper(ScrapeHelper):
         with SessionContext(commit = True) as session:
             doc = session.query(Doc).filter(Doc.id == docid).one_or_none() if docid else None
             if not doc:
-                return "<html><body><p>Skjal {0} finnst ekki.</p></body></html>".format(docid)
-            body = doc.body.replace("\u0084", "„").replace("\u0093", "“").replace("\u0096", "—")
-            return "<html><head><title>{5}</title></head><body><p>Hér er innihald greinarinnar með scheme {0}, netloc {1}, path {2}, query {3}.</p><p>{4}</p></body></html>" \
-                .format(s.scheme, s.netloc, s.path, s.query, body, doc.heading)
+                return "<html><head><title>Fannst ekki</title></head><body><p>Skjal {0} finnst ekki.</p></body></html>".format(docid)
+
+            def clean(txt):
+                """ Do basic clean-up of the raw text """
+                return txt.replace("\u0084", "„").replace("\u0093", "“").replace("\u0096", "—")
+
+            body = clean(doc.body)
+            body = "\n".join("<p>" + pg + "</p>" for pg in body.split("\n"))
+            heading = clean(doc.heading)
+            return "<html><head>" \
+                "<title>{1}</title>" \
+                "<meta property='article:published_time' content='{2}'>" \
+                "<meta property='article:sentiment' content='{3}'>" \
+                "</head><body>{0}</body></html>" \
+                .format(body, heading, str(doc.ts)[0:19], doc.sentiment)
 
     def make_soup(self, doc):
         """ Make a soup object from a document """
@@ -174,10 +187,18 @@ class ReykjanesScraper(ScrapeHelper):
 
     def get_metadata(self, soup):
         """ Analyze the article HTML soup and return metadata """
-        return Metadata(heading = "Hér er fyrirsögn greinarinnar",
-            author = "Höfundur greinarinnar",
-            timestamp = datetime.utcnow(), authority = self.authority,
-            icon = self.icon)
+        metadata = super().get_metadata(soup)
+        metadata.heading = soup.html.head.title.string if soup.html.head.title else "Fyrirsögn"
+        sentiment = ScrapeHelper.meta_property(soup, "article:sentiment")
+        sentiment = int(sentiment) if sentiment else 0
+        metadata.author = self._SENTIMENT_DICT.get(sentiment, "Óþekkt")
+        ts = ScrapeHelper.meta_property(soup, "article:published_time")
+        if ts:
+            metadata.timestamp = datetime(year=int(ts[0:4]), month=int(ts[5:7]), day=int(ts[8:10]),
+                hour=int(ts[11:13]), minute=int(ts[14:16]), second=int(ts[17:19]))
+        else:
+            metadata.timestamp = datetime.utcnow()
+        return metadata
 
     def get_content(self, soup):
         """ Find the actual article content within an HTML soup and return its parent node """

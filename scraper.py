@@ -5,7 +5,8 @@
 
     Scraper module
 
-    Copyright (C) 2016 Vilhjálmur Þorsteinsson
+    Copyright (C) 2018 Miðeind ehf.
+    Author: Vilhjálmur Þorsteinsson
 
        This program is free software: you can redistribute it and/or modify
        it under the terms of the GNU General Public License as published by
@@ -30,20 +31,22 @@
 """
 
 import sys
+import gc
 import getopt
 import time
-#import traceback
+import logging
 
-#from multiprocessing.dummy import Pool
-from multiprocessing import Pool
+# import traceback
 
-from datetime import datetime
+# from multiprocessing.dummy import Pool, cpu_count
+from multiprocessing import Pool, cpu_count
 
-from settings import Settings, ConfigError, UnknownVerbs
+from settings import Settings, ConfigError
 from fetcher import Fetcher
 from article import Article
+from scraperinit import init_roots
 
-from scraperdb import Scraper_DB, SessionContext, Root, IntegrityError
+from scraperdb import SessionContext, Root, IntegrityError
 from scraperdb import Article as ArticleRow
 
 
@@ -51,7 +54,8 @@ class ArticleDescr:
 
     """ Unit of work descriptor that is shipped between processes """
 
-    def __init__(self, root, url):
+    def __init__(self, seq, root, url):
+        self.seq = seq  # Sequence number
         self.root = root
         self.url = url
 
@@ -62,7 +66,7 @@ class Scraper:
 
     def __init__(self):
 
-        print("Initializing scraper instance")
+        logging.info("Initializing scraper instance")
 
     def scrape_root(self, root, helper):
         """ Scrape a root URL """
@@ -70,12 +74,12 @@ class Scraper:
         t0 = time.time()
         # Fetch the root URL and scrape all child URLs that refer
         # to the same domain suffix and we haven't seen before
-        print("Fetching root {0}".format(root.url))
+        logging.info("Fetching root {0}".format(root.url))
 
         # Read the HTML document at the root URL
-        html_doc = Fetcher._fetch_url(root.url)
+        html_doc = Fetcher.raw_fetch_url(root.url)
         if not html_doc:
-            print("Unable to fetch root {0}".format(root.url))
+            logging.warning("Unable to fetch root {0}".format(root.url))
             return
 
         # Parse the HTML document
@@ -96,7 +100,7 @@ class Scraper:
 
                 # noinspection PyBroadException
                 try:
-                    article = ArticleRow(url = url, root_id = root.id)
+                    article = ArticleRow(url=url, root_id=root.id)
                     # Leave article.scraped as NULL for later retrieval
                     session.add(article)
                     session.commit()
@@ -105,58 +109,58 @@ class Scraper:
                     # roll back and continue
                     session.rollback()
                 except Exception as e:
-                    print("Roll back due to exception in scrape_root: {0}".format(e))
+                    logging.warning(
+                        "Roll back due to exception in scrape_root: {0}"
+                        .format(e)
+                    )
                     session.rollback()
 
         t1 = time.time()
 
-        print("Root scrape completed in {0:.2f} seconds".format(t1 - t0))
-
+        logging.info("Root scrape completed in {0:.2f} seconds".format(t1 - t0))
 
     def scrape_article(self, url, helper):
         """ Scrape a single article, retrieving its HTML and metadata """
 
         if helper.skip_url(url):
-            print("Skipping article {0}".format(url))
+            logging.info("Skipping article {0}".format(url))
             return
 
         # Fetch the root URL and scrape all child URLs that refer
         # to the same domain suffix and we haven't seen before
-        print("Scraping article {0}".format(url))
+        logging.info("Scraping article {0}".format(url))
         t0 = time.time()
 
-        with SessionContext(commit = True) as session:
+        with SessionContext(commit=True) as session:
 
             a = Article.scrape_from_url(url, session)
-
             if a is not None:
                 a.store(session)
 
         t1 = time.time()
-        print("Scraping completed in {0:.2f} seconds".format(t1 - t0))
+        logging.info("Scraping completed in {0:.2f} seconds".format(t1 - t0))
 
-
-    def parse_article(self, url, helper):
+    def parse_article(self, seq, url, helper):
         """ Parse a single article """
 
-        print("Parsing article {0}".format(url))
+        logging.info("[{1}] Parsing article {0}".format(url, seq))
         t0 = time.time()
         num_sentences = 0
         num_parsed = 0
 
         # Load the article
-        with SessionContext(commit = True) as session:
-
+        with SessionContext(commit=True) as session:
             a = Article.load_from_url(url, session)
-
             if a is not None:
                 a.parse(session)
                 num_sentences = a.num_sentences
                 num_parsed = a.num_parsed
 
         t1 = time.time()
-        print("Parsing of {2}/{1} sentences completed in {0:.2f} seconds".format(t1 - t0, num_sentences, num_parsed))
-
+        logging.info(
+            "[{3}] Parsing of {2}/{1} sentences completed in {0:.2f} seconds"
+            .format(t1 - t0, num_sentences, num_parsed, seq)
+        )
 
     def _scrape_single_root(self, r):
         """ Single root scraper that will be called by a process within a
@@ -165,15 +169,17 @@ class Scraper:
             # We do not scrape .local roots
             return
         try:
-            print("Scraping root of {0} at {1}...".format(r.description, r.url))
+            logging.info("Scraping root of {0} at {1}...".format(r.description, r.url))
             # Process a single top-level domain and root URL,
             # parsing child URLs that have not been seen before
             helper = Fetcher._get_helper(r)
             if helper:
                 self.scrape_root(r, helper)
         except Exception as e:
-            print("Exception when scraping root at {0}: {1!r}".format(r.url, e))
-
+            logging.warning(
+                "Exception when scraping root at {0}: {1!r}"
+                .format(r.url, e)
+            )
 
     def _scrape_single_article(self, d):
         """ Single article scraper that will be called by a process within a
@@ -183,8 +189,10 @@ class Scraper:
             if helper:
                 self.scrape_article(d.url, helper)
         except Exception as e:
-            print("Exception when scraping article at {0}: {1!r}".format(d.url, e))
-
+            logging.warning(
+                "[{2}] Exception when scraping article at {0}: {1!r}"
+                .format(d.url, e, d.seq)
+            )
 
     def _parse_single_article(self, d):
         """ Single article parser that will be called by a process within a
@@ -192,22 +200,29 @@ class Scraper:
         try:
             helper = Fetcher._get_helper(d.root)
             if helper:
-                self.parse_article(d.url, helper)
-                # Save the unknown verbs accumulated during parsing, if any
-                UnknownVerbs.write()
+                self.parse_article(d.seq, d.url, helper)
+        except KeyboardInterrupt:
+            logging.info("KeyboardInterrupt in _parse_single_article()")
+            sys.exit(1)
+        except MemoryError:
+            # Nothing to do but give up on this process
+            sys.exit(1)
         except Exception as e:
-            print("Exception when parsing article at {0}: {1!r}".format(d.url, e))
-            #traceback.print_exc()
-            #raise e from e
+            logging.warning(
+                "[{2}] Exception when parsing article at {0}: {1!r}"
+                .format(d.url, e, d.seq)
+            )
+            # traceback.print_exc()
+            # raise
+        return True
 
-
-    def go(self, reparse = False, limit = 0, urls = None):
+    def go(self, reparse=False, limit=0, urls=None):
         """ Run a scraping pass from all roots in the scraping database """
 
         version = Article.parser_version()
 
         # Go through the roots and scrape them, inserting into the articles table
-        with SessionContext(commit = True) as session:
+        with SessionContext(commit=True) as session:
 
             if urls is None and not reparse:
 
@@ -219,7 +234,7 @@ class Scraper:
                 # Use a multiprocessing pool to scrape the roots
 
                 pool = Pool(4)
-                pool.map(self._scrape_single_root, iter_roots())
+                pool.imap_unordered(self._scrape_single_root, iter_roots())
                 pool.close()
                 pool.join()
 
@@ -228,15 +243,23 @@ class Scraper:
                     """ Go through any unscraped articles and scrape them """
                     # Note that the query(ArticleRow) below cannot be directly changed
                     # to query(ArticleRow.root, ArticleRow.url) since ArticleRow.root is a joined subrecord
-                    for a in session.query(ArticleRow) \
-                        .filter(ArticleRow.scraped == None).filter(ArticleRow.root_id != None) \
-                        .yield_per(100):
-                        yield ArticleDescr(a.root, a.url)
+                    seq = 0
+                    for a in (
+                        session
+                        .query(ArticleRow)
+                        .filter(ArticleRow.scraped == None)
+                        .filter(ArticleRow.root_id != None)
+                        .yield_per(100)
+                    ):
+                        yield ArticleDescr(seq, a.root, a.url)
+                        seq += 1
 
                 # Use a multiprocessing pool to scrape the articles
 
                 pool = Pool(8)
-                pool.map(self._scrape_single_article, iter_unscraped_articles())
+                pool.imap_unordered(
+                    self._scrape_single_article, iter_unscraped_articles()
+                )
                 pool.close()
                 pool.join()
 
@@ -250,7 +273,11 @@ class Scraper:
                 if reparse:
                     # Reparse articles that were originally parsed with an older
                     # grammar and/or parser version
-                    q = q.filter(ArticleRow.parser_version < version).order_by(ArticleRow.parsed)
+                    q = (
+                        q
+                        .filter(ArticleRow.parser_version < version)
+                        .order_by(ArticleRow.parsed)
+                    )
                 else:
                     # Only parse articles that have no parse tree
                     q = q.filter(ArticleRow.tree == None)
@@ -258,25 +285,38 @@ class Scraper:
                 if limit > 0:
                     # Impose a limit on the query, if given
                     q = q.limit(limit)
-                for a in q:
-                    yield ArticleDescr(a.root, a.url)
+                for seq, a in enumerate(q):
+                    yield ArticleDescr(seq, a.root, a.url)
 
             def iter_urls(urls):
                 """ Iterate through the text file whose name is given in urls """
+                seq = 0
                 with open(urls, "r") as f:
                     for url in f:
                         url = url.strip()
                         if url:
-                            a = session.query(ArticleRow).filter(ArticleRow.url == url).one_or_none()
+                            a = (
+                                session
+                                .query(ArticleRow)
+                                .filter(ArticleRow.url == url)
+                                .one_or_none()
+                            )
                             if a is not None:
                                 # Found the article: yield it
-                                yield ArticleDescr(a.root, a.url)
+                                yield ArticleDescr(seq, a.root, a.url)
+                                seq += 1
 
             # Use a multiprocessing pool to parse the articles.
             # Let the pool work on chunks of articles, recycling the
             # processes after each chunk to contain memory creep.
 
-            CHUNK_SIZE = 100
+            CPU_COUNT = cpu_count()
+            # Distribute the load between the CPUs, although never exceeding
+            # 100 articles per CPU per process cycle
+            if limit > 0:
+                CHUNK_SIZE = min(100 * CPU_COUNT, limit)
+            else:
+                CHUNK_SIZE = 100 * CPU_COUNT
             if urls is None:
                 g = iter_unparsed_articles(reparse, limit)
             else:
@@ -289,23 +329,30 @@ class Scraper:
                 for ad in g:
                     adlist.append(ad)
                     lcnt += 1
-                    if lcnt == CHUNK_SIZE or (limit > 0 and cnt + lcnt >= limit):
+                    if lcnt == CHUNK_SIZE or (0 < limit <= cnt + lcnt):
                         break
                 if lcnt:
                     # Run garbage collection to minimize common memory footprint
-                    import gc
                     gc.collect()
-                    print("Parser processes forking, chunk of {0} articles".format(lcnt))
-                    pool = Pool() # Defaults to using as many processes as there are CPUs
-                    pool.map(self._parse_single_article, adlist)
+                    logging.info(
+                        "Parser processes forking, chunk of {0} articles"
+                        .format(lcnt)
+                    )
+                    # Defaults to using as many processes as there are CPUs
+                    pool = Pool()
+                    try:
+                        pool.imap_unordered(self._parse_single_article, adlist)
+                    except Exception as e:
+                        logging.warning("Caught exception: {0}".format(e))
                     pool.close()
                     pool.join()
-                    # session.commit() # This seems to cause errors
-                    print("Parser processes joined, chunk of {0} articles parsed".format(lcnt))
                     cnt += lcnt
+                    logging.info(
+                        "Parser processes joined, chunk of {0} articles parsed, total {1}"
+                        .format(lcnt, cnt)
+                    )
                 if lcnt < CHUNK_SIZE:
                     break
-
 
     @staticmethod
     def stats():
@@ -330,99 +377,64 @@ class Scraper:
         result = db.execute(q).fetchall()[0]
 
         num_parsed = result[0]
-        
+
         q = "select count(*) from articles where tree is not null and num_sentences > 1;"
 
         result = db.execute(q).fetchall()[0]
 
         num_parsed_over_1 = result[0]
-        
-        print ("Num_articles is {0}, scraped {1}, parsed {2}, parsed with >1 sentence {3}"
-            .format(num_articles, num_scraped, num_parsed, num_parsed_over_1))
 
-        q = "select sum(num_sentences) as sent, sum(num_parsed) as parsed " \
+        logging.info(
+            "Num_articles is {0}, scraped {1}, parsed {2}, parsed with >1 sentence {3}"
+            .format(num_articles, num_scraped, num_parsed, num_parsed_over_1)
+        )
+
+        q = (
+            "select sum(num_sentences) as sent, sum(num_parsed) as parsed "
             "from articles where tree is not null and num_sentences > 1;"
+        )
 
         result = db.execute(q).fetchall()[0]
 
-        num_sentences = result[0] or 0 # Result of query can be None
+        num_sentences = result[0] or 0  # Result of query can be None
         num_sent_parsed = result[1] or 0
 
-        print ("\nNum_sentences is {0}, num_sent_parsed is {1}, ratio is {2:.1f}%"
-            .format(num_sentences, num_sent_parsed, 100.0 * num_sent_parsed / num_sentences))
+        logging.info(
+            "Num_sentences is {0}, num_sent_parsed is {1}, ratio is {2:.1f}%"
+            .format(num_sentences, num_sent_parsed, 100.0 * num_sent_parsed / num_sentences)
+        )
 
 
-def scrape_articles(reparse = False, limit = 0, urls = None):
+def scrape_articles(reparse=False, limit=0, urls=None):
 
-    print("------ Reynir starting scrape -------")
-    ts = "{0}".format(datetime.utcnow())[0:19]
+    logging.info("------ Reynir starting scrape -------")
     if urls is None:
-        print("Time: {0}, limit: {1}, reparse: {2}\n".format(ts, limit, reparse))
+        logging.info("Limit: {0}, reparse: {1}".format(limit, reparse))
     else:
-        print("Time: {0}, URLs read from: {1}\n".format(ts, urls))
+        logging.info("URLs read from: {0}".format(urls))
+    t0 = time.time()
 
     try:
         sc = Scraper()
         try:
-            sc.go(reparse = reparse, limit = limit, urls = urls)
-        except Exception as e:
-            print("Scraper terminated with exception {0}".format(e))
-        finally:
+            sc.go(reparse=reparse, limit=limit, urls=urls)
+            # Successful finish: print stats
             sc.stats()
+        except KeyboardInterrupt:
+            # Terminate process upon Ctrl+C
+            logging.info("KeyboardInterrupt: exiting process")
+            # sys.exit(1)
+        except Exception as e:
+            logging.warning("Scraper terminated with exception {0}".format(e))
     finally:
-        sc = None
+        pass
 
-    ts = "{0}".format(datetime.utcnow())[0:19]
-    print("\nTime: {0}".format(ts))
+    t1 = time.time()
+    logging.info("Elapsed: {0:.1f} minutes".format((t1 - t0) / 60))
+    if limit:
+        logging.info("Average: {0:.2f} seconds per article".format((t1 - t0) / limit))
 
-    print("------ Scrape completed -------")
-
-
-def init_roots():
-    """ Create tables and initialize the scraping roots, if not already present """
-
-    db = SessionContext.db
-
-    try:
-
-        db.create_tables()
-
-        ROOTS = [
-            # Root URL, top-level domain, description, authority
-            ("http://kjarninn.is", "kjarninn.is", "Kjarninn", 1.0, "scrapers.default", "KjarninnScraper", True),
-            ("http://www.ruv.is", "ruv.is", "RÚV", 1.0, "scrapers.default", "RuvScraper", True),
-            ("http://www.visir.is", "visir.is", "Vísir", 0.8, "scrapers.default", "VisirScraper", True),
-            ("http://www.mbl.is/frettir/", "mbl.is", "Morgunblaðið", 0.6, "scrapers.default", "MblScraper", True),
-            ("http://eyjan.pressan.is", "eyjan.pressan.is", "Eyjan", 0.4, "scrapers.default", "EyjanScraper", True),
-            ("http://kvennabladid.is", "kvennabladid.is", "Kvennablaðið", 0.4, "scrapers.default", "KvennabladidScraper", True),
-            ("http://stjornlagarad.is", "stjornlagarad.is", "Stjórnlagaráð", 1.0, "scrapers.default", "StjornlagaradScraper", True),
-            ("https://www.forsaetisraduneyti.is", "forsaetisraduneyti.is", "Forsætisráðuneyti", 1.0, "scrapers.default", "StjornarradScraper", True),
-            ("https://www.innanrikisraduneyti.is", "innanrikisraduneyti.is", "Innanríkisráðuneyti", 1.0, "scrapers.default", "StjornarradScraper", True),
-            ("https://www.fjarmalaraduneyti.is", "fjarmalaraduneyti.is", "Fjármálaráðuneyti", 1.0, "scrapers.default", "StjornarradScraper", True),
-            ("http://reykjanes.local", "reykjanes.local", "Reykjanesbær", 1.0, "scrapers.reykjanes", "ReykjanesScraper", False),
-            ("http://althingi.is", "althingi.is", "Alþingi", 1.0, "scrapers.default", "AlthingiScraper", False)
-        ]
-
-        with SessionContext() as session:
-            for url, domain, description, authority, scr_module, scr_class, scrape in ROOTS:
-                r = Root(url = url, domain = domain, description = description, authority = authority,
-                    scr_module = scr_module, scr_class = scr_class, scrape = scrape,
-                    visible = scrape and not domain.endswith(".local"))
-                session.add(r)
-                try:
-                    # Commit the insert
-                    session.commit()
-                except IntegrityError as e:
-                    # The root already exist: roll back and continue
-                    session.rollback()
-
-            rlist = session.query(Root).all()
-            print("Roots initialized as follows:")
-            for r in rlist:
-                print("{0}".format(r))
-
-    except Exception as e:
-        print("{0}".format(e))
+    logging.info("------ Scrape completed -------")
 
 
 __doc__ = """
@@ -449,24 +461,25 @@ __doc__ = """
 
 
 class Usage(Exception):
-
     def __init__(self, msg):
         self.msg = msg
 
 
-def main(argv = None):
+def main(argv=None):
     """ Guido van Rossum's pattern for a Python main function """
 
     if argv is None:
         argv = sys.argv
     try:
         try:
-            opts, args = getopt.getopt(argv[1:], "hirl:u:",
-                ["help", "init", "reparse", "limit=", "urls="])
+            opts, args = getopt.getopt(
+                argv[1:], "hirl:u:", ["help", "init", "reparse", "limit=", "urls="]
+            )
         except getopt.error as msg:
-             raise Usage(msg)
+            raise Usage(msg)
         init = False
-        limit = 10 # !!! DEBUG default limit on number of articles to parse, unless otherwise specified
+        # !!! DEBUG default limit on number of articles to parse, unless otherwise specified
+        limit = 10
         reparse = False
         urls = None
 
@@ -485,34 +498,37 @@ def main(argv = None):
                     limit = int(a)
                 except ValueError:
                     pass
-            elif o in ('-u', "--urls"):
-                urls = a # Text file with list of URLs
+            elif o in ("-u", "--urls"):
+                urls = a  # Text file with list of URLs
 
         # Process arguments
-        for arg in args:
+        for _ in args:
             pass
 
-        if init:
+        # Set logging format
+        logging.basicConfig(
+            format="%(asctime)s %(levelname)s:%(message)s", level=logging.INFO
+        )
 
+        # Read the configuration settings file
+        try:
+            Settings.read("config/Reynir.conf")
+            # Don't run the scraper in debug mode
+            Settings.DEBUG = False
+        except ConfigError as e:
+            print("Configuration error: {0}".format(e), file=sys.stderr)
+            return 2
+
+        if init:
             # Initialize the scraper database
             init_roots()
-
         else:
-
-            # Read the configuration settings file
-
-            try:
-                Settings.read("config/Reynir.conf")
-            except ConfigError as e:
-                print("Configuration error: {0}".format(e), file = sys.stderr)
-                return 2
-
             # Run the scraper
-            scrape_articles(reparse = reparse, limit = limit, urls = urls)
+            scrape_articles(reparse=reparse, limit=limit, urls=urls)
 
     except Usage as err:
-        print(err.msg, file = sys.stderr)
-        print("For help use --help", file = sys.stderr)
+        print(err.msg, file=sys.stderr)
+        print("For help use --help", file=sys.stderr)
         return 2
 
     finally:

@@ -78,9 +78,6 @@ def article_begin(state):
     url = state["url"] # URL of the article being processed
     # Delete all existing persons for this article
     session.execute(Person.table().delete().where(Person.article_url == url))
-    #persons = session.query(Person).filter_by(article_url = url).all()
-    #for person in persons:
-    #    session.delete(person)
 
 def article_end(state):
     """ Called at the end of article processing """
@@ -116,8 +113,23 @@ INVALID_TITLES = {
     "sig", "væri", "orðið", "ávísun", "hér heima", "lán", "úr láni", "bar", "ver",
     "bætir", "býr", "get", "vera", "eiga", "var", "búa", "setur", "heggur", "átt",
     "keppa", "rétt", "ráðning", "sætti", "hlaut", "mynd", "myndband", "já", "nei",
-    "segi"
+    "segi", "sem", "hjónin"
 }
+
+# Phrases to cut off the ends of titles
+
+CUT_ENDINGS = (
+    "í tilkynningu", "í tilkynningunni",
+    "í fréttatilkynningu", "í fréttatilkynningunni",
+    "í afkomutilkynningu", "í afkomutilkynningunni",
+    "í fjölmiðlum",
+    "í samtali", "í samtalinu",
+    "í viðtali", "í viðtalinu",
+    "í Kastljósi", "í þættinum",
+    "í grein", "í greininni",
+    " sem",
+    "-"
+)
 
 def _add_name(result, mannsnafn, titill, kyn):
     """ Add a name to the resulting name list """
@@ -138,11 +150,11 @@ def _add_name(result, mannsnafn, titill, kyn):
             titill = titill[:-2]
             cut = True
         # Cut off common endings that don't belong in a title
-        for s in ("í tilkynningu", "í fjölmiðlum", "í samtali", "í viðtali",
-            "í Kastljósi", "í þættinum"):
-            if titill.endswith(s):
-                titill = titill[:-1 -len(s)]
-                cut = True
+        if titill:
+            for s in CUT_ENDINGS:
+                if titill.endswith(s):
+                    titill = titill[:-len(s) - (0 if s[0] == ' ' else 1)]
+                    cut = True
     if len(titill) <= 2 or titill.lower() in INVALID_TITLES:
         # Last security check
         return False
@@ -200,6 +212,19 @@ def EfLiður(node, params, result):
     # Ekki senda skýringu eða mannsnafn í gegn um eignarfallslið
     result.del_attribs(("skýring", "skýring_nafn", "mannsnafn", "kyn"))
 
+def NlSérnafnEf(node, params, result):
+    # Leyfa eignarfallslið að standa óbreyttum í titli
+    result._nominative = result._text
+
+def OkkarFramhald(node, params, result):
+    # Ekki breyta eignarfallsliðum í nefnifall
+    # Þetta grípur 'einn okkar', 'hvorugur þeirra'
+    result._nominative = result._text
+
+def AtviksliðurEinkunn(node, params, result):
+    # Ekki breyta atviksliðum í nefnifall
+    result._nominative = result._text
+
 def FsLiður(node, params, result):
     """ Forsetningarliður """
     # Leyfa forsetningarlið að standa óbreyttum í titli
@@ -240,9 +265,30 @@ def SvigaInnihald(node, params, result):
         result._text = ""
         result._nominative = ""
         result.del_attribs(("skýring", "skýring_nafn", "skýring_kyn"))
+    else:
+        # Don't modify cases inside the explanation
+        result._nominative = result._text
 
 # Textar sem ekki eru teknir gildir sem skýringar
 ekki_skýring = { "myndskeið" }
+
+# Forskeyti sem klippt eru framan af streng og e.t.v. annað sett í staðinn
+SEM_PREFIXES = [
+    # Keep this in increasing order by length
+    ("er", None),
+    ("sé", None),
+    ("var", None),
+    ("væri", None),
+    ("nú er", None),
+    ("mun vera", None),
+    ("ekki er", "ekki"),
+    ("ekki var", "var ekki"),
+    ("í dag er", None),
+    ("ekki væri", "ekki"),
+    ("einnig er", None),
+    ("verið hefur", "hefur verið"),
+    ("hefur verið", None)
+]
 
 def NlSkýring(node, params, result):
     """ Skýring nafnliðar (innan sviga eða komma) """
@@ -250,7 +296,7 @@ def NlSkýring(node, params, result):
     def cut(s):
         if s.startswith(", ") or s.startswith("( "):
             s = s[2:]
-        while s.endswith(" ,") or s.endswith(" )") or s.endswith(" ."):
+        while s.endswith(" ,") or s.endswith(" )") or s.endswith(" .") or s.endswith(" ("):
             s = s[:-2]
         return s
 
@@ -258,22 +304,19 @@ def NlSkýring(node, params, result):
     if s.startswith("sem "):
         # Jón, sem er heimsmethafi í hástökki,
         s = s[4:]
-        if s.startswith("er "):
-            s = s[3:]
-        elif s.startswith("væri "):
-            s = s[5:]
-        elif s.startswith("nú er "):
-            s = s[6:]
-        elif s.startswith("einnig er "):
-            s = s[10:]
-        elif s.startswith("ekki er "):
-            s = "ekki " + s[8:]
-        elif s.startswith("ekki var "):
-            s = "var ekki " + s[9:]
-        elif s.startswith("ekki væri "):
-            s = "ekki " + s[10:]
-        elif s.startswith("verið hefur "):
-            s = "hefur verið " + s[12:]
+        for prefix, replacement in reversed(SEM_PREFIXES):
+            if s.startswith(prefix + " "):
+                if replacement:
+                    s = replacement + " " + s[len(prefix) + 1:]
+                else:
+                    s = s[len(prefix) + 1:]
+                break
+        # Reverse word order such as "sem kallaður er" -> "er kallaður",
+        # "sem talinn er líklegastur" -> "er talinn líklegastur"
+        words = s.split()
+        if len(words) > 2 and words[1] in { "er", "var", "væri", "yrði" }:
+            # Juxtapose the first and second words
+            s = " ".join([words[1], words[0]] + words[2:])
     else:
         # Ég talaði við Jón (heimsmethafa í hástökki)
         s = cut(result._nominative)

@@ -1,38 +1,55 @@
 """
+
     Reynir: Natural language processing for Icelandic
 
     Article class
 
-    Copyright (c) 2016 Vilhjalmur Thorsteinsson
-    All rights reserved
-    See the accompanying README.md file for further licensing and copyright information.
+    Copyright (C) 2018 Miðeind ehf.
+    Author: Vilhjálmur Þorsteinsson
 
-    This module contains a class modeling an article originating from a scraped web page.
+       This program is free software: you can redistribute it and/or modify
+       it under the terms of the GNU General Public License as published by
+       the Free Software Foundation, either version 3 of the License, or
+       (at your option) any later version.
+       This program is distributed in the hope that it will be useful,
+       but WITHOUT ANY WARRANTY; without even the implied warranty of
+       MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+       GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see http://www.gnu.org/licenses/.
+
+
+    This module contains a class modeling an article originating
+    from a scraped web page.
 
 """
 
 import json
 import uuid
 from datetime import datetime
-from collections import OrderedDict, defaultdict, namedtuple
+from collections import OrderedDict, defaultdict
 
-from settings import Settings, NoIndexWords
-from scraperdb import Article as ArticleRow, SessionContext, Word, DataError
+from settings import NoIndexWords
+from scraperdb import Article as ArticleRow, SessionContext, Word, Root, DataError, desc
 from fetcher import Fetcher
-from tokenizer import TOK
-from fastparser import Fast_Parser, ParseError, ParseForestNavigator, ParseForestDumper
+from tokenizer import TOK, tokenize
+from reynir.fastparser import Fast_Parser, ParseError, ParseForestDumper
 from incparser import IncrementalParser
+from tree import Tree
+from treeutil import TreeUtility
 
 
-WordTuple = namedtuple("WordTuple", ["stem", "cat"])
+# We don't bother parsing sentences that have more tokens than 100,
+# since they require lots of memory (>16 GB) and may take
+# minutes to parse
+MAX_SENTENCE_TOKENS = 100
 
-# The word categories that are indexed in the words table
-_CATEGORIES_TO_INDEX = frozenset((
-    "kk", "kvk", "hk", "person_kk", "person_kvk", "entity",
-    "lo", "so"
-))
 
 class Article:
+
+    """ An Article represents a new article typically scraped from a web site,
+        as it is tokenized, parsed and stored in the Reynir database. """
 
     _parser = None
 
@@ -40,7 +57,7 @@ class Article:
     def _init_class(cls):
         """ Initialize class attributes """
         if cls._parser is None:
-            cls._parser = Fast_Parser(verbose = False) # Don't emit diagnostic messages
+            cls._parser = Fast_Parser(verbose=False)  # Don't emit diagnostic messages
 
     @classmethod
     def cleanup(cls):
@@ -66,8 +83,7 @@ class Article:
         cls._init_class()
         return cls._parser.version
 
-
-    def __init__(self, uuid = None, url = None):
+    def __init__(self, uuid=None, url=None):
         self._uuid = uuid
         self._url = url
         self._heading = ""
@@ -91,14 +107,14 @@ class Article:
         self._root_id = None
         self._root_domain = None
         self._helper = None
-        self._tokens = None # JSON string
-        self._raw_tokens = None # The tokens themselves
-        self._words = None # The individual word stems, in a dictionary
+        self._tokens = None  # JSON string
+        self._raw_tokens = None  # The tokens themselves
+        self._words = None  # The individual word stems, in a dictionary
 
     @classmethod
     def _init_from_row(cls, ar):
         """ Initialize a fresh Article instance from a database row object """
-        a = cls(uuid = ar.id)
+        a = cls(uuid=ar.id)
         a._url = ar.url
         a._heading = ar.heading
         a._author = ar.author
@@ -121,15 +137,15 @@ class Article:
         a._tokens = ar.tokens
         assert a._raw_tokens is None
         a._root_id = ar.root_id
-        a._root_domain = ar.root.domain
+        a._root_domain = ar.root.domain if ar.root else None
         return a
 
     @classmethod
-    def _init_from_scrape(cls, url, enclosing_session = None):
+    def _init_from_scrape(cls, url, enclosing_session=None):
         """ Scrape an article from its URL """
         if url is None:
             return None
-        a = cls(url = url)
+        a = cls(url=url)
         with SessionContext(enclosing_session) as session:
             # Obtain a helper corresponding to the URL
             html, metadata, helper = Fetcher.fetch_url_html(url, session)
@@ -151,7 +167,7 @@ class Article:
             return a
 
     @classmethod
-    def load_from_url(cls, url, enclosing_session = None):
+    def load_from_url(cls, url, enclosing_session=None):
         """ Load or scrape an article, given its URL """
         with SessionContext(enclosing_session) as session:
             ar = session.query(ArticleRow).filter(ArticleRow.url == url).one_or_none()
@@ -161,7 +177,7 @@ class Article:
             return cls._init_from_scrape(url, session)
 
     @classmethod
-    def scrape_from_url(cls, url, enclosing_session = None):
+    def scrape_from_url(cls, url, enclosing_session=None):
         """ Force fetch of an article, given its URL """
         with SessionContext(enclosing_session) as session:
             ar = session.query(ArticleRow).filter(ArticleRow.url == url).one_or_none()
@@ -172,125 +188,20 @@ class Article:
             return a
 
     @classmethod
-    def load_from_uuid(cls, uuid, enclosing_session = None):
+    def load_from_uuid(cls, uuid, enclosing_session=None):
         """ Load an article, given its UUID """
         with SessionContext(enclosing_session) as session:
             try:
-                ar = session.query(ArticleRow).filter(ArticleRow.id == uuid).one_or_none()
+                ar = (
+                    session
+                    .query(ArticleRow)
+                    .filter(ArticleRow.id == uuid)
+                    .one_or_none()
+                )
             except DataError:
                 # Probably wrong UUID format
                 ar = None
             return None if ar is None else cls._init_from_row(ar)
-
-    class _Annotator(ParseForestNavigator):
-
-        """ Local utility subclass to navigate a parse forest and annotate the
-            original token list with the corresponding terminal matches """
-
-        def __init__(self, tmap):
-            super().__init__()
-            self._tmap = tmap
-
-        def _visit_token(self, level, node):
-            """ At token node """
-            ix = node.token.index # Index into original sentence
-            assert ix not in self._tmap
-            meaning = node.token.match_with_meaning(node.terminal)
-            self._tmap[ix] = (node.terminal, None if isinstance(meaning, bool) else meaning) # Map from original token to matched terminal
-            return None
-
-    @staticmethod
-    def _terminal_map(tree):
-        """ Return a dict containing a map from original token indices to matched terminals """
-        tmap = dict()
-        if tree is not None:
-            Article._Annotator(tmap).go(tree)
-        return tmap
-
-    @staticmethod
-    def _dump_tokens(tokens, tree, words, error_index = None):
-
-        """ Generate a string (JSON) representation of the tokens in the sentence.
-
-            The JSON token dict contents are as follows:
-
-                t.x is original token text.
-                t.k is the token kind (TOK.xxx). If omitted, the kind is TOK.WORD.
-                t.t is the name of the matching terminal, if any.
-                t.m is the BÍN meaning of the token, if any, as a tuple as follows:
-                    t.m[0] is the lemma (stofn)
-                    t.m[1] is the word category (ordfl)
-                    t.m[2] is the word subcategory (fl)
-                    t.m[3] is the word meaning/declination (beyging)
-                t.v contains auxiliary information, depending on the token kind
-                t.err is 1 if the token is an error token
-
-            This function has the side effect of filling in the words dictionary
-            with (stem, cat) keys and occurrence counts.
-
-        """
-
-        # Map tokens to associated terminals, if any
-        tmap = Article._terminal_map(tree) # tmap is an empty dict if there's no parse tree
-        dump = []
-        for ix, t in enumerate(tokens):
-            # We have already cut away paragraph and sentence markers (P_BEGIN/P_END/S_BEGIN/S_END)
-            d = dict(x = t.txt)
-            terminal = None
-            wt = None
-            if ix in tmap:
-                # There is a token-terminal match
-                if t.kind == TOK.PUNCTUATION:
-                    if t.txt == "-":
-                        # Hyphen: check whether it is matching an em or en-dash terminal
-                        terminal, _ = tmap[ix]
-                        if terminal.cat == "em":
-                            d["x"] = "—" # Substitute em dash (will be displayed with surrounding space)
-                        elif terminal.cat == "en":
-                            d["x"] = "–" # Substitute en dash
-                else:
-                    # Annotate with terminal name and BÍN meaning (no need to do this for punctuation)
-                    terminal, meaning = tmap[ix]
-                    d["t"] = terminal.name
-                    if meaning is not None:
-                        if terminal.first == "fs":
-                            # Special case for prepositions since they're really
-                            # resolved from the preposition list in Main.conf, not from BÍN
-                            m = (meaning.ordmynd, "fs", "alm", terminal.variant(0).upper())
-                        else:
-                            m = (meaning.stofn, meaning.ordfl, meaning.fl, meaning.beyging)
-                        d["m"] = m
-                        # Note the word stem and category
-                        wt = WordTuple(stem = m[0].replace("-", ""), cat = m[1])
-                    elif t.kind == TOK.ENTITY:
-                        wt = WordTuple(stem = t.txt, cat = "entity")
-            if t.kind != TOK.WORD:
-                # Optimize by only storing the k field for non-word tokens
-                d["k"] = t.kind
-            if t.val is not None and t.kind not in { TOK.WORD, TOK.ENTITY, TOK.PUNCTUATION }:
-                # For tokens except words, entities and punctuation, include the val field
-                if t.kind == TOK.PERSON:
-                    d["v"] = t.val[0][0] # Include only the name of the person in nominal form
-                    # Hack to make sure that the gender information is communicated in
-                    # the terminal name (in some cases the terminal only contains the case)
-                    gender = t.val[0][1]
-                    if terminal:
-                        if not terminal.name.endswith("_" + gender):
-                            d["t"] = terminal.name + "_" + gender
-                    else:
-                        # There is no terminal: cop out by adding a separate gender field
-                        d["g"] = gender
-                    wt = WordTuple(stem = t.val[0][0], cat = "person_" + gender)
-                else:
-                    d["v"] = t.val
-            if ix == error_index:
-                # Mark the error token, if present
-                d["err"] = 1
-            dump.append(d)
-            if words is not None and wt is not None:
-                # Add the (stem, cat) combination to the words dictionary
-                words[wt] += 1
-        return dump
 
     def person_names(self):
         """ A generator yielding all person names in an article token stream """
@@ -318,6 +229,18 @@ class Article:
                             # The entity name
                             yield t["x"]
 
+    def create_register(self, session, all_names=False):
+        """ Create a name register dictionary for this article """
+        register = {}
+        from query import add_name_to_register, add_entity_to_register
+
+        for name in self.person_names():
+            add_name_to_register(name, register, session, all_names=all_names)
+        # Add register of entity names
+        for name in self.entity_names():
+            add_entity_to_register(name, register, session, all_names=all_names)
+        return register
+
     def _store_words(self, session):
         """ Store word stems """
         assert session is not None
@@ -325,22 +248,22 @@ class Article:
         session.execute(Word.table().delete().where(Word.article_id == self._uuid))
         # Index the words by storing them in the words table
         for word, cnt in self._words.items():
-            if word.cat not in _CATEGORIES_TO_INDEX:
+            if word.cat not in NoIndexWords.CATEGORIES_TO_INDEX:
                 # We do not index closed word categories and non-distinctive constructs
                 continue
             if (word.stem, word.cat) in NoIndexWords.SET:
                 # Specifically excluded from indexing in Reynir.conf (Main.conf)
                 continue
+            if len(word.stem) > Word.MAX_WORD_LEN:
+                # Shield the database from too long words
+                continue
             # Interesting word: let's index it
-            w = Word(
-                article_id = self._uuid,
-                stem = word.stem,
-                cat = word.cat,
-                cnt = cnt
-            )
+            w = Word(article_id=self._uuid, stem=word.stem, cat=word.cat, cnt=cnt)
             session.add(w)
+        # Offload the new data from Python to PostgreSQL
+        session.flush()
 
-    def _parse(self, enclosing_session = None, verbose = False):
+    def _parse(self, enclosing_session=None, verbose=False):
         """ Parse the article content to yield parse trees and annotated token list """
         with SessionContext(enclosing_session) as session:
 
@@ -348,7 +271,7 @@ class Article:
             toklist = Fetcher.tokenize_html(self._url, self._html, session)
 
             bp = self.get_parser()
-            ip = IncrementalParser(bp, toklist, verbose = verbose)
+            ip = IncrementalParser(bp, toklist, verbose=verbose)
 
             # List of paragraphs containing a list of sentences containing token lists
             # for sentences in string dump format (1-based paragraph and sentence indices)
@@ -369,18 +292,47 @@ class Article:
                 for sent in p.sentences():
 
                     num_sent += 1
+                    num_tokens = len(sent)
 
-                    if sent.parse():
+                    # We don't attempt to parse very long sentences (>100 tokens)
+                    # since they are memory intensive (>16 GB) and may take
+                    # minutest to process
+                    if num_tokens <= MAX_SENTENCE_TOKENS and sent.parse():
                         # Obtain a text representation of the parse tree
-                        trees[num_sent] = ParseForestDumper.dump_forest(sent.tree)
-                        pgs[-1].append(Article._dump_tokens(sent.tokens, sent.tree, words))
+                        token_dicts = TreeUtility.dump_tokens(
+                            sent.tokens, sent.tree, words
+                        )
+                        # Create a verbose text representation of
+                        # the highest scoring parse tree
+                        tree = ParseForestDumper.dump_forest(
+                            sent.tree, token_dicts=token_dicts
+                        )
+                        # Add information about the sentence tree's score
+                        # and the number of tokens
+                        trees[num_sent] = "\n".join(
+                            [
+                                "C{0}".format(sent.score),
+                                "L{0}".format(num_tokens),
+                                tree
+                            ]
+                        )
                     else:
-                        # Error or no parse: add an error index entry for this sentence
-                        eix = sent.err_index
+                        # Error, sentence too long or no parse:
+                        # add an error index entry for this sentence
+                        if num_tokens > MAX_SENTENCE_TOKENS:
+                            # Set the error index at the first
+                            # token outside the maximum limit
+                            eix = MAX_SENTENCE_TOKENS
+                        else:
+                            eix = sent.err_index
+                        token_dicts = TreeUtility.dump_tokens(
+                            sent.tokens, None, None, eix
+                        )
                         trees[num_sent] = "E{0}".format(eix)
-                        pgs[-1].append(Article._dump_tokens(sent.tokens, None, None, eix))
 
-            parse_time = ip.parse_time
+                    pgs[-1].append(token_dicts)
+
+            # parse_time = ip.parse_time
 
             self._parsed = datetime.utcnow()
             self._parser_version = bp.version
@@ -391,41 +343,44 @@ class Article:
 
             # Make one big JSON string for the paragraphs, sentences and tokens
             self._raw_tokens = pgs
-            self._tokens = json.dumps(pgs, separators = (',', ':'), ensure_ascii = False)
+            self._tokens = json.dumps(pgs, separators=(",", ":"), ensure_ascii=False)
+
+            # Keep the bag of words (stem, category, count for each word)
             self._words = words
-            # self._tokens = "[" + ",\n".join("[" + ",\n".join(sent for sent in p) + "]" for p in pgs) + "]"
+
             # Create a tree representation string out of all the accumulated parse trees
-            self._tree = "".join("S{0}\n{1}\n".format(key, val) for key, val in trees.items())
+            self._tree = "".join(
+                "S{0}\n{1}\n".format(key, val) for key, val in trees.items()
+            )
 
-
-    def store(self, enclosing_session = None):
+    def store(self, enclosing_session=None):
         """ Store an article in the database, inserting it or updating """
-        with SessionContext(enclosing_session, commit = True) as session:
+        with SessionContext(enclosing_session, commit=True) as session:
             if self._uuid is None:
                 # Insert a new row
                 self._uuid = str(uuid.uuid1())
                 ar = ArticleRow(
-                    id = self._uuid,
-                    url = self._url,
-                    root_id = self._root_id,
-                    heading = self._heading,
-                    author = self._author,
-                    timestamp = self._timestamp,
-                    authority = self._authority,
-                    scraped = self._scraped,
-                    parsed = self._parsed,
-                    processed = self._processed,
-                    indexed = self._indexed,
-                    scr_module = self._scr_module,
-                    scr_class = self._scr_class,
-                    scr_version = self._scr_version,
-                    parser_version = self._parser_version,
-                    num_sentences = self._num_sentences,
-                    num_parsed = self._num_parsed,
-                    ambiguity = self._ambiguity,
-                    html = self._html,
-                    tree = self._tree,
-                    tokens = self._tokens
+                    id=self._uuid,
+                    url=self._url,
+                    root_id=self._root_id,
+                    heading=self._heading,
+                    author=self._author,
+                    timestamp=self._timestamp,
+                    authority=self._authority,
+                    scraped=self._scraped,
+                    parsed=self._parsed,
+                    processed=self._processed,
+                    indexed=self._indexed,
+                    scr_module=self._scr_module,
+                    scr_class=self._scr_class,
+                    scr_version=self._scr_version,
+                    parser_version=self._parser_version,
+                    num_sentences=self._num_sentences,
+                    num_parsed=self._num_parsed,
+                    ambiguity=self._ambiguity,
+                    html=self._html,
+                    tree=self._tree,
+                    tokens=self._tokens,
                 )
                 session.add(ar)
                 if self._words:
@@ -434,7 +389,12 @@ class Article:
                 return True
 
             # Update an already existing row by UUID
-            ar = session.query(ArticleRow).filter(ArticleRow.id == self._uuid).one_or_none()
+            ar = (
+                session
+                .query(ArticleRow)
+                .filter(ArticleRow.id == self._uuid)
+                .one_or_none()
+            )
             if ar is None:
                 # UUID not found: something is wrong here...
                 return False
@@ -468,29 +428,28 @@ class Article:
                 self._store_words(session)
             return True
 
-    def prepare(self, enclosing_session = None, verbose = False, reload_parser = False):
+    def prepare(self, enclosing_session=None, verbose=False, reload_parser=False):
         """ Prepare the article for display. If it's not already tokenized and parsed, do it now. """
-        with SessionContext(enclosing_session, commit = True) as session:
+        with SessionContext(enclosing_session, commit=True) as session:
             if self._tree is None or self._tokens is None:
                 if reload_parser:
                     # We need a parse: Make sure we're using the newest grammar
                     self.reload_parser()
-                self._parse(session, verbose = verbose)
+                self._parse(session, verbose=verbose)
                 if self._tree is not None or self._tokens is not None:
                     # Store the updated article in the database
                     self.store(session)
 
-    def parse(self, enclosing_session = None, verbose = False, reload_parser = False):
+    def parse(self, enclosing_session=None, verbose=False, reload_parser=False):
         """ Force a parse of the article """
-        with SessionContext(enclosing_session, commit = True) as session:
+        with SessionContext(enclosing_session, commit=True) as session:
             if reload_parser:
                 # We need a parse: Make sure we're using the newest grammar
                 self.reload_parser()
-            self._parse(session, verbose = verbose)
+            self._parse(session, verbose=verbose)
             if self._tree is not None or self._tokens is not None:
                 # Store the updated article in the database
                 self.store(session)
-
 
     @property
     def url(self):
@@ -513,6 +472,10 @@ class Article:
         return self._timestamp
 
     @property
+    def parsed(self):
+        return self._parsed
+
+    @property
     def num_sentences(self):
         return self._num_sentences
 
@@ -527,6 +490,10 @@ class Article:
     @property
     def root_domain(self):
         return self._root_domain
+
+    @property
+    def authority(self):
+        return self._authority
 
     @property
     def html(self):
@@ -554,3 +521,143 @@ class Article:
             self._num_tokens = cnt
         return self._num_tokens
 
+    @staticmethod
+    def token_stream(limit=None, skip_errors=True):
+        """ Generator of a token stream consisting of `limit` sentences (or less) from the
+            most recently parsed articles. After each sentence, None is yielded. """
+        with SessionContext(commit=True, read_only=True) as session:
+
+            q = (
+                session
+                .query(ArticleRow.url, ArticleRow.parsed, ArticleRow.tokens)
+                .filter(ArticleRow.tokens != None)
+                .order_by(desc(ArticleRow.parsed))
+                .yield_per(200)
+            )
+
+            count = 0
+            for a in q:
+                doc = json.loads(a.tokens)
+                for pg in doc:
+                    for sent in pg:
+                        if not sent:
+                            continue
+                        if skip_errors and any("err" in t for t in sent):
+                            # Skip error sentences
+                            continue
+                        for t in sent:
+                            # Yield the tokens
+                            yield t
+                        yield None  # End-of-sentence marker
+                        # Are we done?
+                        count += 1
+                        if limit is not None and count >= limit:
+                            return
+
+    @staticmethod
+    def sentence_stream(limit=None, skip=None, skip_errors=True):
+        """ Generator of a sentence stream consisting of `limit` sentences (or less) from the
+            most recently parsed articles. Each sentence is a list of token dicts. """
+        with SessionContext(commit=True, read_only=True) as session:
+
+            q = (
+                session
+                .query(ArticleRow.url, ArticleRow.parsed, ArticleRow.tokens)
+                .filter(ArticleRow.tokens != None)
+                .order_by(desc(ArticleRow.parsed))
+                .yield_per(200)
+            )
+
+            count = 0
+            skipped = 0
+            for a in q:
+                doc = json.loads(a.tokens)
+                for pg in doc:
+                    for sent in pg:
+                        if not sent:
+                            continue
+                        if skip_errors and any("err" in t for t in sent):
+                            # Skip error sentences
+                            continue
+                        if skip is not None and skipped < skip:
+                            # If requested, skip sentences from the front (useful for test set)
+                            skipped += 1
+                            continue
+                        # Yield the sentence as a fresh token list
+                        yield [t for t in sent]
+                        # Are we done?
+                        count += 1
+                        if limit is not None and count >= limit:
+                            return
+
+    @classmethod
+    def articles(cls, criteria, enclosing_session=None):
+        """ Generator of Article objects from the database that meet the given criteria """
+        # The criteria are currently "timestamp", "author" and "domain",
+        # as well as "order_by_parse" which if True indicates that the result
+        # should be ordered with the most recently parsed articles first.
+        with SessionContext(
+            commit=True, read_only=True, session=enclosing_session
+        ) as session:
+
+            # Only fetch articles that have a parse tree
+            q = session.query(ArticleRow).filter(ArticleRow.tree != None)
+
+            # timestamp is assumed to contain a tuple: (from, to)
+            if criteria and "timestamp" in criteria:
+                ts = criteria["timestamp"]
+                q = (
+                    q
+                    .filter(ArticleRow.timestamp >= ts[0])
+                    .filter(ArticleRow.timestamp < ts[1])
+                )
+
+            if criteria and "author" in criteria:
+                author = criteria["author"]
+                q = q.filter(ArticleRow.author == author)
+
+            if criteria and ("visible" in criteria or "domain" in criteria):
+                # Need a join with Root for these criteria
+                q = q.join(Root)
+                if "visible" in criteria:
+                    # Return only articles from roots with the specified visibility
+                    visible = criteria["visible"]
+                    assert isinstance(visible, bool)
+                    q = q.filter(Root.visible == visible)
+                if "domain" in criteria:
+                    # Return only articles from the specified domain
+                    domain = criteria["domain"]
+                    assert isinstance(domain, str)
+                    q = q.filter(Root.domain == domain)
+
+            if criteria and criteria.get("order_by_parse"):
+                # Order with newest parses first
+                q = q.order_by(desc(ArticleRow.parsed))
+
+            for arow in q.yield_per(500):
+                yield cls._init_from_row(arow)
+
+    @classmethod
+    def all_matches(cls, criteria, pattern, enclosing_session=None):
+        """ Generator of SimpleTree objects (see matcher.py) from articles matching
+            the given criteria and the pattern """
+
+        with SessionContext(
+            commit=True, read_only=True, session=enclosing_session
+        ) as session:
+
+            # t0 = time.time()
+            mcnt = acnt = tcnt = 0
+            # print("Starting article loop")
+            for a in cls.articles(criteria, enclosing_session=session):
+                acnt += 1
+                tree = Tree(url=a.url, authority=a.authority)
+                tree.load(a.tree)
+                for ix, simple_tree in tree.simple_trees():
+                    tcnt += 1
+                    for match in simple_tree.all_matches(pattern):
+                        yield (a, ix, match)
+                        mcnt += 1
+            # t1 = time.time()
+            # print("{0} articles with {1} trees examined, {2} matches in {3:.2f} seconds"
+            #     .format(acnt, tcnt, mcnt, t1-t0))

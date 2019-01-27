@@ -4,7 +4,7 @@
 
     Scraper database model
 
-    Copyright (C) 2016 Vilhjálmur Þorsteinsson
+    Copyright (C) 2018 Miðeind ehf.
 
        This program is free software: you can redistribute it and/or modify
        it under the terms of the GNU General Public License as published by
@@ -27,19 +27,32 @@
 
 import sys
 import platform
+from time import sleep
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, backref
-from sqlalchemy import Table, Column, Integer, String, Float, DateTime, Sequence, \
-    Boolean, UniqueConstraint, ForeignKey, PrimaryKeyConstraint
+from sqlalchemy import (
+    Table,
+    Column,
+    Integer,
+    String,
+    Float,
+    DateTime,
+    Sequence,
+    Boolean,
+    UniqueConstraint,
+    ForeignKey,
+    PrimaryKeyConstraint,
+)
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import SQLAlchemyError as SqlError
 from sqlalchemy.exc import IntegrityError as SqlIntegrityError
 from sqlalchemy.exc import DataError as SqlDataError
 from sqlalchemy import desc as SqlDesc
 from sqlalchemy.dialects.postgresql import UUID as psql_UUID
-
 from settings import Settings
+from sqlalchemy import func as dbfunc
 
 
 # Create the SQLAlchemy ORM Base class
@@ -54,7 +67,6 @@ desc = SqlDesc
 
 
 class Scraper_DB:
-
     """ Wrapper around the SQLAlchemy connection, engine and session """
 
     def __init__(self):
@@ -63,12 +75,16 @@ class Scraper_DB:
 
         # Assemble the right connection string for CPython/psycopg2 vs.
         # PyPy/psycopg2cffi, respectively
+
         is_pypy = platform.python_implementation() == "PyPy"
-        conn_str = 'postgresql+{0}://reynir:reynir@{1}/scraper' \
-            .format('psycopg2cffi' if is_pypy else 'psycopg2', Settings.DB_HOSTNAME)
+        conn_str = "postgresql+{0}://reynir:reynir@{1}:{2}/scraper".format(
+            "psycopg2cffi" if is_pypy else "psycopg2",
+            Settings.DB_HOSTNAME,
+            Settings.DB_PORT,
+        )
         self._engine = create_engine(conn_str)
         # Create a Session class bound to this engine
-        self._Session = sessionmaker(bind = self._engine)
+        self._Session = sessionmaker(bind=self._engine)
 
     def create_tables(self):
         """ Create all missing tables in the database """
@@ -87,15 +103,15 @@ class Scraper_DB:
 class classproperty:
     def __init__(self, f):
         self.f = f
+
     def __get__(self, obj, owner):
         return self.f(owner)
 
 
 class SessionContext:
-
     """ Context manager for database sessions """
 
-    _db = None # Singleton instance of Scraper_DB
+    _db = None  # Singleton instance of Scraper_DB
 
     @classproperty
     def db(cls):
@@ -108,15 +124,20 @@ class SessionContext:
         """ Clean up the reference to the singleton Scraper_DB instance """
         cls._db = None
 
-    def __init__(self, session = None, commit = False):
+    def __init__(self, session=None, commit=False, read_only=False):
 
         if session is None:
             # Create a new session that will be automatically committed
             # (if commit == True) and closed upon exit from the context
-            db = self.db # Creates a new Scraper_DB instance if needed
+            db = self.db  # Creates a new Scraper_DB instance if needed
             self._new_session = True
             self._session = db.session
-            self._commit = commit
+            if read_only:
+                # Set the transaction as read only, which can save resources
+                self._session.execute("SET TRANSACTION READ ONLY")
+                self._commit = True
+            else:
+                self._commit = commit
         else:
             self._new_session = False
             self._session = session
@@ -143,17 +164,16 @@ class SessionContext:
 
 
 class Root(Base):
-    
     """ Represents a scraper root, i.e. a base domain and root URL """
 
-    __tablename__ = 'roots'
+    __tablename__ = "roots"
 
     # Primary key
-    id = Column(Integer, Sequence('roots_id_seq'), primary_key=True)
+    id = Column(Integer, Sequence("roots_id_seq"), primary_key=True)
 
     # Domain suffix, root URL, human-readable description
-    domain = Column(String, nullable = False)
-    url = Column(String, nullable = False)
+    domain = Column(String, nullable=False)
+    url = Column(String, nullable=False)
     description = Column(String)
 
     # Default author
@@ -161,61 +181,66 @@ class Root(Base):
     # Default authority of this source, 1.0 = most authoritative, 0.0 = least authoritative
     authority = Column(Float)
     # Finish time of last scrape of this root
-    scraped = Column(DateTime, index = True)
+    scraped = Column(DateTime, index=True)
     # Module to use for scraping
     scr_module = Column(String(80))
     # Class within module to use for scraping
     scr_class = Column(String(80))
     # Are articles of this root visible on the Greynir web?
-    visible = Column(Boolean, default = True)
+    visible = Column(Boolean, default=True)
     # Should articles of this root be scraped automatically?
-    scrape = Column(Boolean, default = True)
+    scrape = Column(Boolean, default=True)
 
     # The combination of domain + url must be unique
-    __table_args__ = (
-        UniqueConstraint('domain', 'url'),
-    )
+    __table_args__ = (UniqueConstraint("domain", "url"),)
 
     def __repr__(self):
-        return "Root(domain='{0}', url='{1}', description='{2}')" \
-            .format(self.domain, self.url, self.description)
+        return "Root(domain='{0}', url='{1}', description='{2}')".format(
+            self.domain, self.url, self.description
+        )
 
 
 class Article(Base):
-
     """ Represents an article from one of the roots, to be scraped or having already been scraped """
 
-    __tablename__ = 'articles'
+    __tablename__ = "articles"
 
     # The article URL is the primary key
-    url = Column(String, primary_key = True)
+    url = Column(String, primary_key=True)
 
     # UUID
-    id = Column(psql_UUID(as_uuid = False), index = True, nullable = False, unique = True,
-        server_default = text("uuid_generate_v1()"))
+    id = Column(
+        psql_UUID(as_uuid=False),
+        index=True,
+        nullable=False,
+        unique=True,
+        server_default=text("uuid_generate_v1()"),
+    )
 
     # Foreign key to a root
-    root_id = Column(Integer,
+    root_id = Column(
+        Integer,
         # We don't delete associated articles if the root is deleted
-        ForeignKey('roots.id', onupdate="CASCADE", ondelete="SET NULL"))
+        ForeignKey("roots.id", onupdate="CASCADE", ondelete="SET NULL"),
+    )
 
     # Article heading, if known
     heading = Column(String)
     # Article author, if known
     author = Column(String)
     # Article time stamp, if known
-    timestamp = Column(DateTime, index = True)
+    timestamp = Column(DateTime, index=True)
 
     # Authority of this article, 1.0 = most authoritative, 0.0 = least authoritative
     authority = Column(Float)
     # Time of the last scrape of this article
-    scraped = Column(DateTime, index = True)
+    scraped = Column(DateTime, index=True)
     # Time of the last parse of this article
-    parsed = Column(DateTime, index = True)
+    parsed = Column(DateTime, index=True)
     # Time of the last processing of this article
-    processed = Column(DateTime, index = True)
+    processed = Column(DateTime, index=True)
     # Time of the last indexing of this article
-    indexed = Column(DateTime, index = True)
+    indexed = Column(DateTime, index=True)
     # Module used for scraping
     scr_module = Column(String(80))
     # Class within module used for scraping
@@ -235,41 +260,49 @@ class Article(Base):
     tree = Column(String)
     # The tokens of the article in JSON string format
     tokens = Column(String)
+    # The article topic vector as an array of floats in JSON string format
+    topic_vector = Column(String)
 
     # The back-reference to the Root parent of this Article
-    root = relationship("Root", foreign_keys="Article.root_id",
-        backref=backref('articles', order_by=url))
+    root = relationship(
+        "Root",
+        foreign_keys="Article.root_id",
+        backref=backref("articles", order_by=url),
+    )
 
     def __repr__(self):
-        return "Article(url='{0}', heading='{1}', scraped={2})" \
-            .format(self.url, self.heading, self.scraped)
+        return "Article(url='{0}', heading='{1}', scraped={2})".format(
+            self.url, self.heading, self.scraped
+        )
 
 
 class Person(Base):
-
     """ Represents a person """
 
-    __tablename__ = 'persons'
+    __tablename__ = "persons"
 
     # Primary key
-    id = Column(Integer, Sequence('persons_id_seq'), primary_key=True)
+    id = Column(Integer, Sequence("persons_id_seq"), primary_key=True)
 
     # Foreign key to an article
-    article_url = Column(String,
+    article_url = Column(
+        String,
         # We don't delete associated persons if the article is deleted
-        ForeignKey('articles.url', onupdate="CASCADE", ondelete="SET NULL"),
-        index = True, nullable = True)
+        ForeignKey("articles.url", onupdate="CASCADE", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
 
     # Name
-    name = Column(String, index = True)
-    
+    name = Column(String, index=True)
+
     # Title
-    title = Column(String, index = True)
+    title = Column(String, index=True)
     # Title in all lowercase
-    title_lc = Column(String, index = True)
+    title_lc = Column(String, index=True)
 
     # Gender
-    gender = Column(String(3), index = True)
+    gender = Column(String(3), index=True)
 
     # Authority of this fact, 1.0 = most authoritative, 0.0 = least authoritative
     authority = Column(Float)
@@ -278,11 +311,12 @@ class Person(Base):
     timestamp = Column(DateTime)
 
     # The back-reference to the Article parent of this Person
-    article = relationship("Article", backref=backref('persons', order_by=name))
+    article = relationship("Article", backref=backref("persons", order_by=name))
 
     def __repr__(self):
-        return "Person(id='{0}', name='{1}', title={2})" \
-            .format(self.id, self.name, self.title)
+        return "Person(id='{0}', name='{1}', title={2})".format(
+            self.id, self.name, self.title
+        )
 
     @classmethod
     def table(cls):
@@ -290,26 +324,28 @@ class Person(Base):
 
 
 class Entity(Base):
-
     """ Represents an entity """
 
-    __tablename__ = 'entities'
+    __tablename__ = "entities"
 
     # Primary key
-    id = Column(Integer, Sequence('entities_id_seq'), primary_key=True)
+    id = Column(Integer, Sequence("entities_id_seq"), primary_key=True)
 
     # Foreign key to an article
-    article_url = Column(String,
+    article_url = Column(
+        String,
         # We don't delete associated persons if the article is deleted
-        ForeignKey('articles.url', onupdate="CASCADE", ondelete="SET NULL"),
-        index = True, nullable = True)
+        ForeignKey("articles.url", onupdate="CASCADE", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
 
     # Name
-    name = Column(String, index = True)
+    name = Column(String, index=True)
     # Verb ('er', 'var', 'sé')
-    verb = Column(String, index = True)
+    verb = Column(String, index=True)
     # Entity definition
-    definition = Column(String, index = True)
+    definition = Column(String, index=True)
 
     # Authority of this fact, 1.0 = most authoritative, 0.0 = least authoritative
     authority = Column(Float)
@@ -318,11 +354,73 @@ class Entity(Base):
     timestamp = Column(DateTime)
 
     # The back-reference to the Article parent of this Entity
-    article = relationship("Article", backref=backref('entities', order_by=name))
+    article = relationship("Article", backref=backref("entities", order_by=name))
 
     def __repr__(self):
-        return "Entity(id='{0}', name='{1}', verb='{2}', definition='{3}')" \
-            .format(self.id, self.name, self.verb, self.definition)
+        return "Entity(id='{0}', name='{1}', verb='{2}', definition='{3}')".format(
+            self.id, self.name, self.verb, self.definition
+        )
+
+    @classmethod
+    def table(cls):
+        return cls.__table__
+
+
+class Location(Base):
+    """ Represents a location """
+
+    __tablename__ = "locations"
+
+    # UUID
+    id = Column(
+        psql_UUID(as_uuid=False),
+        index=True,
+        nullable=False,
+        unique=True,
+        primary_key=True,
+        server_default=text("uuid_generate_v1()")
+    )
+
+    # Foreign key to an article
+    article_url = Column(
+        String,
+        # We don't delete associated location if the article is deleted
+        ForeignKey("articles.url", onupdate="CASCADE", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
+
+    # Name
+    name = Column(String, index=True)
+
+    # Kind (e.g. 'address', 'street', 'country', 'region', 'placename')
+    kind = Column(String(16), index=True)
+
+    # Country (ISO 3166-1 alpha-2, e.g. 'IS')
+    country = Column(String(2))
+    
+    # Continent ISO code (e.g. 'EU')
+    continent = Column(String(2))
+
+    # Coordinates (WGS84)
+    latitude = Column(Float)
+    longitude = Column(Float)
+
+    # Additional data
+    data = Column(JSONB)
+
+    # Timestamp of this entry
+    timestamp = Column(DateTime)
+
+    # The back-reference to the Article parent of this Location
+    article = relationship("Article", backref=backref("locations", order_by=name))
+
+    __table_args__ = (UniqueConstraint("name", "kind", "article_url"),)
+
+    def __repr__(self):
+        return "Location(id='{0}', name='{1}', kind='{2}', country='{3}')".format(
+            self.id, self.name, self.kind, self.country
+        )
 
     @classmethod
     def table(cls):
@@ -330,35 +428,39 @@ class Entity(Base):
 
 
 class Word(Base):
-
     """ Represents a word occurring in an article """
 
-    __tablename__ = 'words'
+    __tablename__ = "words"
+
+    MAX_WORD_LEN = 64
 
     # Foreign key to an article
-    article_id = Column(psql_UUID(as_uuid = False),
-        ForeignKey('articles.id', onupdate="CASCADE", ondelete="CASCADE"),
-        nullable = False)
+    article_id = Column(
+        psql_UUID(as_uuid=False),
+        ForeignKey("articles.id", onupdate="CASCADE", ondelete="CASCADE"),
+        nullable=False,
+    )
 
     # The word stem
-    stem = Column(String(64), index = True, nullable = False)
+    stem = Column(String(MAX_WORD_LEN), index=True, nullable=False)
 
     # The word category
-    cat = Column(String(16), index = True, nullable = False)
+    cat = Column(String(16), index=True, nullable=False)
 
     # Count of occurrences
-    cnt = Column(Integer, nullable = False)
+    cnt = Column(Integer, nullable=False)
 
     # The back-reference to the Article parent of this Word
-    article = relationship("Article", backref=backref('words'))
+    article = relationship("Article", backref=backref("words"))
 
     __table_args__ = (
-        PrimaryKeyConstraint('article_id', 'stem', 'cat', name='words_pkey'),
+        PrimaryKeyConstraint("article_id", "stem", "cat", name="words_pkey"),
     )
 
     def __repr__(self):
-        return "Word(stem='{0}', cat='{1}', cnt='{2}')" \
-            .format(self.stem, self.cat, self.cnt)
+        return "Word(stem='{0}', cat='{1}', cnt='{2}')".format(
+            self.stem, self.cat, self.cnt
+        )
 
     @classmethod
     def table(cls):
@@ -366,33 +468,34 @@ class Word(Base):
 
 
 class Topic(Base):
-
     """ Represents a topic for an article """
 
-    __tablename__ = 'topics'
+    __tablename__ = "topics"
 
-    id = Column(psql_UUID(as_uuid = False),
-        server_default = text("uuid_generate_v1()"), primary_key = True)
+    id = Column(
+        psql_UUID(as_uuid=False),
+        server_default=text("uuid_generate_v1()"),
+        primary_key=True,
+    )
 
     # The topic name
-    name = Column(String(128), nullable = False, index = True)
+    name = Column(String(128), nullable=False, index=True)
 
     # An identifier for the topic, such as 'sport', 'business'...
     # The identifier must be usable as a CSS class name.
-    identifier = Column(String(32), nullable = False)
+    identifier = Column(String(32), nullable=False)
 
     # The topic keywords, in the form word1/cat word2/cat...
-    keywords = Column(String, nullable = False)
+    keywords = Column(String, nullable=False)
 
     # The associated vector, in JSON format
-    vector = Column(String) # Is initally NULL
+    vector = Column(String)  # Is initally NULL
 
     # The cosine distance threshold to apply for this topic
     threshold = Column(Float)
 
     def __repr__(self):
-        return "Topic(name='{0}')" \
-            .format(self.name)
+        return "Topic(name='{0}')".format(self.name)
 
     @classmethod
     def table(cls):
@@ -400,26 +503,31 @@ class Topic(Base):
 
 
 class ArticleTopic(Base):
-
     """ Represents an article having a topic, a 1:N relationship """
 
-    __tablename__ = 'atopics'
+    __tablename__ = "atopics"
 
-    article_id = Column(psql_UUID(as_uuid = False),
-        ForeignKey('articles.id', onupdate="CASCADE", ondelete="CASCADE"),
-        nullable = False, index = True)
+    article_id = Column(
+        psql_UUID(as_uuid=False),
+        ForeignKey("articles.id", onupdate="CASCADE", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
 
-    topic_id = Column(psql_UUID(as_uuid = False),
-        ForeignKey('topics.id', onupdate="CASCADE", ondelete="CASCADE"),
-        nullable = False, index = True)
+    topic_id = Column(
+        psql_UUID(as_uuid=False),
+        ForeignKey("topics.id", onupdate="CASCADE", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
 
     # The back-reference to the Article parent of this ArticleTopic
-    article = relationship("Article", backref=backref('atopics'))
+    article = relationship("Article", backref=backref("atopics"))
     # The back-reference to the Topic parent of this ArticleTopic
-    topic = relationship("Topic", backref=backref('atopics'))
+    topic = relationship("Topic", backref=backref("atopics"))
 
     __table_args__ = (
-        PrimaryKeyConstraint('article_id', 'topic_id', name='atopics_pkey'),
+        PrimaryKeyConstraint("article_id", "topic_id", name="atopics_pkey"),
     )
 
     def __repr__(self):
@@ -431,36 +539,33 @@ class ArticleTopic(Base):
 
 
 class Trigram(Base):
-
     """ Represents a trigram of tokens from a parsed sentence """
 
-    __tablename__ = 'trigrams'
+    __tablename__ = "trigrams"
 
     MAX_WORD_LEN = 64
 
     # Token 1
-    t1 = Column(String(MAX_WORD_LEN), nullable = False)
+    t1 = Column(String(MAX_WORD_LEN), nullable=False)
 
     # Token 2
-    t2 = Column(String(MAX_WORD_LEN), nullable = False)
+    t2 = Column(String(MAX_WORD_LEN), nullable=False)
 
     # Token 3
-    t3 = Column(String(MAX_WORD_LEN), nullable = False)
+    t3 = Column(String(MAX_WORD_LEN), nullable=False)
 
     # Frequency
-    frequency = Column(Integer, default = 0, nullable = False)
+    frequency = Column(Integer, default=0, nullable=False)
 
     # The "upsert" query (see explanation below)
     _Q = """
         insert into trigrams as tg (t1, t2, t3, frequency) values(:t1, :t2, :t3, 1)
             on conflict (t1, t2, t3)
-            do update set frequency = tg.frequency + 1
-            where tg.t1 = :t1 and tg.t2 = :t2 and tg.t3 = :t3;
+            do update set frequency = tg.frequency + 1;
         """
+    # where tg.t1 = :t1 and tg.t2 = :t2 and tg.t3 = :t3;
 
-    __table_args__ = (
-        PrimaryKeyConstraint('t1', 't2', 't3', name='trigrams_pkey'),
-    )
+    __table_args__ = (PrimaryKeyConstraint("t1", "t2", "t3", name="trigrams_pkey"),)
 
     @staticmethod
     def upsert(session, t1, t2, t3):
@@ -476,7 +581,7 @@ class Trigram(Base):
             t2 = t2[0:mwl]
         if len(t3) > mwl:
             t3 = t3[0:mwl]
-        session.execute(self._Q, dict(t1 = t1, t2 = t2, t3 = t3))
+        session.execute(Trigram._Q, dict(t1=t1, t2=t2, t3=t3))
 
     @staticmethod
     def delete_all(session):
@@ -484,8 +589,7 @@ class Trigram(Base):
         session.execute("delete from trigrams;")
 
     def __repr__(self):
-        return "Trigram(t1='{0}', t2='{1}', t3='{2}')" \
-            .format(self.t1, self.t2, self.t3)
+        return "Trigram(t1='{0}', t2='{1}', t3='{2}')".format(self.t1, self.t2, self.t3)
 
     @classmethod
     def table(cls):
@@ -493,31 +597,58 @@ class Trigram(Base):
 
 
 class Link(Base):
-
     """ Represents a (content-type, key) to URL mapping,
         usable for instance to cache image searches """
 
-    __tablename__ = 'links'
+    __tablename__ = "links"
 
-    __table_args__ = (
-        PrimaryKeyConstraint('ctype', 'key', name='links_pkey'),
-    )
+    __table_args__ = (PrimaryKeyConstraint("ctype", "key", name="links_pkey"),)
 
     # Content type, for instance 'image' or 'text'
-    ctype = Column(String(32), nullable = False, index = True)
+    ctype = Column(String(32), nullable=False, index=True)
 
     # Key, for instance a person name
-    key = Column(String(256), nullable = False, index = True)
+    key = Column(String(256), nullable=False, index=True)
 
     # Associated content, often JSON
     content = Column(String)
 
     # Timestamp of this entry
-    timestamp = Column(DateTime, nullable = False)
+    timestamp = Column(DateTime, nullable=False)
 
     def __repr__(self):
-        return "Link(ctype='{0}', key='{1}', content='{2}')" \
-            .format(self.ctype, self.key, self.content)
+        return "Link(ctype='{0}', key='{1}', content='{2}', ts='{3}')".format(
+            self.ctype, self.key, self.content, self.timestamp
+        )
+
+    @classmethod
+    def table(cls):
+        return cls.__table__
+
+
+class BlacklistedLink(Base):
+    """ Represents a link blacklisted for a particular key """
+
+    __tablename__ = "blacklist"
+
+    __table_args__ = (PrimaryKeyConstraint("key", "url", name="blacklisted_pkey"),)
+
+    # Key, for instance a person name
+    key = Column(String(256), nullable=False, index=True)
+
+    # URL
+    url = Column(String(2000), nullable=False, index=True)
+
+    # Type (e.g. "image")
+    link_type = Column(String(32))
+
+    # Timestamp of this entry
+    timestamp = Column(DateTime, nullable=False)
+
+    def __repr__(self):
+        return "BlacklistedLink(key='{0}', url='{1}', type='{2}', ts='{3}')".format(
+            self.key, self.url, self.link_type, self.timestamp
+        )
 
     @classmethod
     def table(cls):
@@ -525,12 +656,15 @@ class Link(Base):
 
 
 class _BaseQuery:
-
     def __init__(self):
         pass
 
+    def execute_q(self, session, q, **kwargs):
+        """ Execute the given query and return the result from fetchall() """
+        return session.execute(q, kwargs).fetchall()
+
     def execute(self, session, **kwargs):
-        """ Execute the query and return the result from fetchall() """
+        """ Execute the default query and return the result from fetchall() """
         return session.execute(self._Q, kwargs).fetchall()
 
     def scalar(self, session, **kwargs):
@@ -539,7 +673,6 @@ class _BaseQuery:
 
 
 class GenderQuery(_BaseQuery):
-
     """ A query for gender representation in the persons table """
 
     _Q = """
@@ -560,7 +693,6 @@ class GenderQuery(_BaseQuery):
 
 
 class StatsQuery(_BaseQuery):
-
     """ A query for statistics on articles """
 
     _Q = """
@@ -575,8 +707,30 @@ class StatsQuery(_BaseQuery):
         """
 
 
-class BestAuthorsQuery(_BaseQuery):
+class ChartsQuery(_BaseQuery):
+    """ Statistics on article, sentence and parse count  
+        for all sources for a given time period """
 
+    _Q = """
+        select r.description AS name,
+            count(a.id) AS cnt,
+            coalesce(sum(a.num_sentences),0) as sent,
+            coalesce(sum(a.num_parsed), 0) as parsed
+            from roots as r
+            left join articles as a on r.id = a.root_id
+            and a.timestamp >= :start and a.timestamp < :end
+            where r.visible and r.scrape
+            group by name
+            order by name
+        """
+
+    @classmethod
+    def period(cls, start, end, enclosing_session=None):
+        with SessionContext(session=enclosing_session, commit=False) as session:
+            return cls().execute(session, start=start, end=end)
+
+
+class BestAuthorsQuery(_BaseQuery):
     """ A query for statistics on authors with the best parse ratios.
         The query only includes authors with at least 10 articles. """
 
@@ -595,11 +749,12 @@ class BestAuthorsQuery(_BaseQuery):
             ) as q
             where cnt >= {0}
             order by ratio desc;
-        """.format(_MIN_ARTICLE_COUNT)
+        """.format(
+        _MIN_ARTICLE_COUNT
+    )
 
 
 class RelatedWordsQuery(_BaseQuery):
-
     """ A query for word stems commonly occurring in the same articles
         as the given word stem """
 
@@ -617,16 +772,36 @@ class RelatedWordsQuery(_BaseQuery):
         """
 
     @classmethod
-    def rel(cls, stem, limit = 20, enclosing_session = None):
+    def rel(cls, stem, limit=21, enclosing_session=None):
         """ Return a list of (stem, category, count) tuples describing
             word stems that are related to the given stem, in descending
             order of number of appearances. """
-        with SessionContext(session = enclosing_session, commit = True) as session:
-            return cls().execute(session, root = stem, limit = limit)
+        # The default limit is 21 instead of 20 because the original stem
+        # is usually included in the result list
+        with SessionContext(session=enclosing_session, commit=True) as session:
+            return cls().execute(session, root=stem, limit=limit)
+
+
+class TermTopicsQuery(_BaseQuery):
+    """ A query for topic vectors of documents where a given (stem, cat)
+        tuple appears. We return the newest articles first, in case the
+        query result is limited by a specified limit. """
+
+    _Q = """
+        select topic_vector, q.cnt
+            from (
+                select a.id as id, sum(w.cnt) as cnt
+                from articles a, words w
+                where a.id = w.article_id and w.stem = :stem and w.cat = :cat
+                group by a.id
+            ) as q
+            join articles on q.id = articles.id
+            order by articles.timestamp desc
+            limit :limit;
+        """
 
 
 class ArticleCountQuery(_BaseQuery):
-
     """ A query yielding the number of articles containing any of the given word stems """
 
     _Q = """
@@ -639,30 +814,44 @@ class ArticleCountQuery(_BaseQuery):
         """
 
     @classmethod
-    def count(cls, stems, enclosing_session = None):
+    def count(cls, stems, enclosing_session=None):
         """ Return a count of articles containing any of the given word
             stems. stems may be a single string or an iterable. """
-        with SessionContext(session = enclosing_session, commit = True) as session:
-            return cls().scalar(session,
-                stems = tuple((stems,)) if isinstance(stems, str) else tuple(stems))
+        with SessionContext(session=enclosing_session, commit=True) as session:
+            return cls().scalar(
+                session,
+                stems=tuple((stems,)) if isinstance(stems, str) else tuple(stems),
+            )
 
 
 class ArticleListQuery(_BaseQuery):
-
     """ A query returning a list of the newest articles that contain
         a particular word stem """
 
-    _Q = """
-        select distinct a.id, a.heading, a.timestamp, r.domain
+    _Q_lower = """
+        select distinct a.id, a.heading, a.timestamp, r.domain, a.url
             from words w, articles a, roots r
             where w.stem = :stem and w.article_id = a.id and a.root_id = r.id and r.visible
             order by a.timestamp desc
             limit :limit;
         """
 
-    @classmethod
-    def articles(cls, stem, limit = 20, enclosing_session = None):
-        """ Return a list of the newest articles containing the given stem. """
-        with SessionContext(session = enclosing_session, commit = True) as session:
-            return cls().execute(session, stem = stem, limit = limit)
+    _Q_upper = """
+        select distinct a.id, a.heading, a.timestamp, r.domain, a.url
+            from words w, articles a, roots r
+            where (w.stem = :stem or w.stem = :lstem) and w.article_id = a.id and a.root_id = r.id and r.visible
+            order by a.timestamp desc
+            limit :limit;
+        """
 
+    @classmethod
+    def articles(cls, stem, limit=20, enclosing_session=None):
+        """ Return a list of the newest articles containing the given stem. """
+        with SessionContext(session=enclosing_session, commit=True) as session:
+            if stem == stem.lower():
+                # Lower case stem
+                return cls().execute_q(session, cls._Q_lower, stem=stem, limit=limit)
+            # Upper case stem: include the lower case as well
+            return cls().execute_q(
+                session, cls._Q_upper, stem=stem, lstem=stem.lower(), limit=limit
+            )

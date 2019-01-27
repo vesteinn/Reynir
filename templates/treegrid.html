@@ -1,0 +1,860 @@
+
+{% extends "container-fluid.html" %}
+
+/* Copyright (C) 2017 Miðeind ehf. */
+
+{% block styles %}
+
+<link href="{{ url_for('static', filename='css/main-bootstrap.css') }}" rel='stylesheet' type='text/css'>
+
+<style>
+
+   /* Styles for D3/SVG tree graph */
+
+   .node circle {
+      fill: white;
+      stroke: #888;
+      stroke-width: 3px;
+      cursor: default;
+   }
+
+   .node circle.hovering {
+      stroke-width: 5px;
+   }
+
+   /* Outline (stroke) colors for word categories */
+   .node.kk circle,
+   .node.kvk circle,
+   .node.hk circle {
+      stroke: #337ab7;
+   }
+   .node.to circle,
+   .node.töl circle,
+   .node.fn circle,
+   .node.pfn circle,
+   .node.abfn circle {
+      stroke: #5bc0de;
+   }
+   .node.lo circle {
+      stroke: #5cb85c;
+   }
+   .node.nhm circle,
+   .node.so circle {
+      stroke: #d9534f;
+   }
+   .node.st circle,
+   .node.stt circle
+   {
+      stroke: #f0ad4e;
+   }
+   .node.person-kk circle {
+      stroke: #337ab7;
+   }
+   .node.person-kvk circle {
+      stroke: #d9534f;
+   }
+
+   /* Special case for punctuation: filled circle */
+   .node.punct circle {
+      fill: #888;
+   }
+
+   .node text { font-size: 12px; }
+
+   .node-nonterminal text {
+      fill: white;
+      cursor: default;
+   }
+
+   .node-nonterminal rect {
+      fill: steelblue;
+      stroke: steelblue;
+      stroke-width: 3px;
+   }
+
+   .node-nonterminal.P rect {
+      fill: black;
+      stroke: black;
+   }
+
+   .node-nonterminal.S rect,
+   .node-nonterminal.S-MAIN rect,
+   .node-nonterminal.S-COND rect,
+   .node-nonterminal.S-CONS rect,
+   .node-nonterminal.S-REF rect,
+   .node-nonterminal.S-ADV-TEMP rect,
+   .node-nonterminal.S-ADV-PURP rect,
+   .node-nonterminal.S-ADV-ACK rect,
+   .node-nonterminal.S-ADV-CONS rect,
+   .node-nonterminal.S-ADV-CAUSE rect,
+   .node-nonterminal.S-ADV-COND rect,
+   .node-nonterminal.S-EXPLAIN rect,
+   .node-nonterminal.S-PREFIX rect,
+   .node-nonterminal.S-QUOTE rect,
+   .node-nonterminal.IP rect
+   {
+      fill: #f0ad4e;
+      stroke: #f0ad4e;
+   }
+
+   .node-nonterminal.VP rect,
+   .node-nonterminal.VP-PP rect,
+   .node-nonterminal.VP-SEQ rect {
+      fill: #d9534f;
+      stroke: #d9534f;
+   }
+
+   .node-nonterminal.NP rect,
+   .node-nonterminal.NP-SUBJ rect,
+   .node-nonterminal.NP-OBJ rect,
+   .node-nonterminal.NP-IOBJ rect,
+   .node-nonterminal.NP-PRD rect
+   {
+      /* Dark blue */
+      fill: #337ab7;
+      stroke: #337ab7;
+   }
+
+   .node-nonterminal.NP-POSS rect,
+   .node-nonterminal.NP-DAT rect,
+   .node-nonterminal.NP-TITLE rect,
+   .node-nonterminal.NP-ADDR rect,
+   .node-nonterminal.NP-AGE rect,
+   .node-nonterminal.NP-MEASURE rect
+   {
+      /* Light blue */
+      fill: #5bc0de;
+      stroke: #5bc0de;
+   }
+
+   .node-nonterminal.PP rect {
+      fill: #888;
+      stroke: #888;
+   }
+
+   .node-nonterminal.ADVP rect,
+   .node-nonterminal.ADVP-DATE rect,
+   .node-nonterminal.ADVP-DATE-REL rect,
+   .node-nonterminal.ADVP-DATE-ABS rect,
+   .node-nonterminal.ADVP-TIMESTAMP-REL rect,
+   .node-nonterminal.ADVP-TIMESTAMP-ABS rect,
+   .node-nonterminal.ADVP-TMP-SET rect,
+   .node-nonterminal.ADVP-DUR rect,
+   .node-nonterminal.ADVP-DUR-REL rect,
+   .node-nonterminal.ADVP-DUR-ABS rect,
+   .node-nonterminal.ADVP-DUR-TIME rect
+   {
+      fill: #5cb85c;
+      stroke: #5cb85c;
+   }
+
+   .node-nonterminal.ADJP rect
+   {
+      fill: #5cb85c;
+      stroke: #5cb85c;
+   }
+
+   .node-terminal text {
+      font-weight: bold;
+   }
+
+   .node-terminal text.symbol {
+      stroke: transparent;
+      stroke-width: 0;
+      fill: white;
+      /*noinspection CssNoGenericFontName*/
+      font-family: 'Glyphicons Regular';
+      font-weight: normal;
+      font-style: normal;
+      cursor: default;
+   }
+   .node-terminal.kk text.symbol,
+   .node-terminal.kvk text.symbol,
+   .node-terminal.hk text.symbol
+   {
+      fill: #337ab7;
+   }
+   .node-terminal.to text.symbol,
+   .node-terminal.töl text.symbol,
+   .node-terminal.fn text.symbol,
+   .node-terminal.pfn text.symbol,
+   .node-terminal.abfn text.symbol
+   {
+      fill: #5bc0de;
+   }
+   .node-terminal.person-kk text.symbol {
+      fill: #337ab7;
+   }
+   .node-terminal.person-kvk text.symbol {
+      fill: #d9534f;
+   }
+   .node-terminal.entity text.symbol {
+      fill: #888;
+   }
+   .node-terminal.st text.symbol,
+   .node-terminal.stt text.symbol {
+      fill: #f0ad4e;
+      transform: rotate(45deg);
+   }
+   .node-terminal.so text.symbol {
+      fill: #d9534f;
+      transform: rotate(15deg);
+   }
+   .node-terminal.nhm text.symbol {
+      fill: #d9534f;
+   }
+   .node-terminal.lo text.symbol {
+      fill: #5cb85c;
+      transform: rotate(45deg);
+   }
+   .node-terminal.fs text.symbol,
+   .node-terminal.uh text.symbol,
+   .node-terminal.gr text.symbol {
+      fill: #888;
+   }
+   .node-terminal.year text.symbol,
+   .node-terminal.currency text.symbol,
+   .node-terminal.number text.symbol,
+   .node-terminal.percent text.symbol,
+   .node-terminal.timestamp text.symbol,
+   .node-terminal.timestampabs text.symbol,
+   .node-terminal.timestamprel text.symbol,
+   .node-terminal.time text.symbol,
+   .node-terminal.date text.symbol,
+   .node-terminal.dateabs text.symbol,
+   .node-terminal.daterel text.symbol,
+   .node-terminal.measurement text.symbol
+   {
+      fill: #888;
+   }
+   .node-terminal.ao text.symbol,
+   .node-terminal.eo text.symbol,
+   .node-terminal.tao text.symbol,
+   .node-terminal.spao text.symbol
+   {
+      fill: #888;
+   }
+
+   .node-terminal.punct text {
+      fill: white;
+   }
+
+   .link {
+      fill: none;
+      stroke: #ccc;
+      stroke-width: 2px;
+   }
+
+   div#canvas svg {
+      background-color: #f6f6f6;
+   }
+
+   div#simple {
+      /* Start off with the simple tree hidden */
+      visibility: hidden;
+   }
+
+</style>
+
+{% endblock %}
+
+{% block scripts %}
+
+<!-- D3 graphics library -->
+<script src="https://d3js.org/d3.v4.min.js"></script>
+
+{% endblock %}
+
+{%- block content -%}
+
+<div class="input-parsegrid">
+
+   <div class="row">
+
+      <table id="tbl-edit-sent">
+      <tr>
+      <td>
+         <button id="edit-sent" title="Breyta málsgrein" class="btn btn-warning">
+            <span class="glyphicon glyphicon-edit"></span>&nbsp;Breyta
+         </button>
+      </td>
+      <td>
+         <h4 class="txt">{{ txt }}</h4>
+      </td>
+      </tr>
+      </table>
+
+   </div>
+
+{% if not tbl -%}
+   <div class="row">
+      <p class="options">Engin greining fannst.</p>
+   </div>
+{%- endif %}
+
+</div>
+
+{% if tbl -%}
+
+<div id="tree-tabs">
+
+   <ul id="tree-hdr" class="nav nav-tabs" role="tablist">
+      <li role="presentation">
+         <a href="#tree" aria-controls="tree" role="tab" data-toggle="tab">
+            <span class="glyphicon glyphicon-share" style="transform: rotate(90deg)"></span>&nbsp;Tré
+         </a>
+      </li>
+      <li role="presentation" class="active">
+         <a href="#simple" aria-controls="simple" role="tab" data-toggle="tab">
+            <span class="glyphicon glyphicon-tag"></span>&nbsp;Einfalt
+         </a>
+      </li>
+      <li role="presentation">
+         <a href="#full" aria-controls="full" role="tab" data-toggle="tab">
+            <span class="glyphicon glyphicon-tags"></span>&nbsp;Ítarlegt
+         </a>
+      </li>
+      <li role="presentation">
+         <a href="#stats" aria-controls="full" role="tab" data-toggle="tab">
+            <span class="glyphicon glyphicon-info"></span>&nbsp;Tölfræði
+         </a>
+      </li>
+   </ul>
+
+   <!-- Tab panes -->
+   <div class="tab-content">
+
+      <div role="tabpanel" class="tab-pane" id="tree">
+
+         <!-- D3/SVG canvas for tree graph -->
+
+         <div class="grid">
+            <div class="table-responsive" id="canvas-container">
+               <div id="canvas">
+                  <!-- SVG stuff is inserted here -->
+               </div>
+            </div>
+         </div>
+      </div>
+
+      <div role="tabpanel" class="tab-pane active" id="simple">
+
+<!-- Simple parse tree -->
+
+<div class="grid">
+   <div class="table-responsive">
+      <table id="treegrid-simple">
+{% for r in tbl %}
+{%- set row_loop = loop -%}
+         <tr>
+{%- for c in r -%}
+{%- if c[1] is none -%}
+{%- elif "n" in c[1] -%}
+<td class="nt" colspan="{{ c[0] }}" rowspan="1">{{ c[1]["n"] }}</td>
+{%- else -%}
+<td class="t" colspan="{{ c[0] }}" rowspan="{{ height - row_loop.index0 }}">
+{% set tname = c[1]["t"] if "t" in c[1] else "" %}
+{%- if tname | first != "'" and tname | first != '"' -%}
+{{ tname }}<br>
+{%- endif -%}
+<span class="tok">{{ c[1]["x"] if "x" in c[1] else ("&nbsp;" | safe) }}</span>
+</td>
+{%- endif -%}
+{%- endfor -%}
+         </tr>
+{% endfor %}
+      </table>
+   </div>
+</div>
+
+      </div>
+
+      <div role="tabpanel" class="tab-pane" id="full">
+
+<!-- Full parse tree -->
+
+<div class="grid">
+   <div class="table-responsive">
+      <table id="treegrid-full">
+{% for r in full_tbl %}
+{%- set row_loop = loop -%}
+         <tr>
+{%- for c in r -%}
+{%- if c[1] is none -%}
+{%- elif "n" in c[1] -%}
+<td class="nt" colspan="{{ c[0] }}" rowspan="1">{{ c[1]["n"] }}</td>
+{%- else -%}
+<td class="t" colspan="{{ c[0] }}" rowspan="{{ full_height - row_loop.index0 }}">
+{% set tname = c[1]["t"] if "t" in c[1] else "" %}
+{%- if tname | first != "'" and tname | first != '"' -%}
+{{ tname }}<br>
+{%- endif -%}
+<span class="tok">{{ c[1]["x"] if "x" in c[1] else ("&nbsp;" | safe) }}</span>
+</td>
+{%- endif -%}
+{%- endfor -%}
+         </tr>
+{% endfor %}
+      </table>
+   </div>
+</div>
+
+      </div>
+
+      <div role="tabpanel" class="tab-pane" id="stats">
+
+         <!-- Statistics -->
+
+         <div class="panel panel-default" id="stats-panel">
+         <table class="table table-hover">
+         <tbody>
+            <tr><td>Fjöldi einda</td><td class="count">{{ stats.num_tokens | format_is }}</td></tr>
+            <tr><td>Vinnslutími</td><td class="count">{{ stats.total_time | format_is(2) }} sek.</td></tr>
+            <tr><td>Fjöldi mögulegra trjáa</td><td class="count">{{ stats.num_combinations | format_is }}</td></tr>
+            <tr><td>Stig besta trés</td><td class="count">{{ stats.total_score | format_is }}</td></tr>
+            <tr><td>Margræðnistuðull</td><td class="count">{{ stats.ambiguity | format_is(2) }}</td></tr>
+            <tr><td class="explain" colspan="2">
+               ({{ stats.ambiguity | format_is(2) }} ^ {{ stats.num_tokens | format_is}} ≈ {{ stats.num_combinations | format_is }})</td></tr>
+         </tbody>
+         </table>
+         </div>
+
+      </div>
+
+   </div>
+</div>
+
+{% include 'hover-infobox.html' %}
+
+{%- endif %}
+
+{% endblock %}
+
+{% block endscripts %}
+
+<script src="{{ url_for('static', filename='js/common.js') }}"></script>
+
+<script>
+
+// Display a tree hierarchy using the D3 library and SVG
+
+var treeData = {{ tree | tojson }};
+
+// Determine the drawing surface
+var margin = { top: 60, right: 20, bottom: 30, left: 20 },
+   width = $("#treegrid-simple").width() - margin.right - margin.left,
+   height = {{ 100 + height * 80 }} - margin.top - margin.bottom;
+
+// Configure the tree layout object
+var tree = d3.tree()
+   .size([width, height])
+   .separation(function(a, b) {
+      // Horizontal separation between tree nodes
+      if (a.parent != b.parent)
+         // Nodes are not siblings: double separation
+         return 2.2;
+      // For siblings, increase separation linearly with their combined
+      // text (caption) length
+      // var aLen = a.data.text.length;
+      var aLen = a.data.n ? Math.max(a.data.text.length, 11) : a.data.text.length;
+      // var bLen = b.data.text.length;
+      var bLen = b.data.n ? Math.max(b.data.text.length, 11) : b.data.text.length;
+      return Math.max(1.20, 0.115 * (aLen + bLen));
+   });
+
+// Create a D3 hierarchy from the parse tree
+var root = treeData === null ? null : d3.hierarchy(treeData, function(d) {
+      // Yield the children of node d
+      return d.p;
+   });
+
+// The graphics canvas
+var g = d3.select("div#canvas")
+   .append("svg")
+      .attr("width", width + margin.right + margin.left)
+      .attr("height", height + margin.top + margin.bottom)
+   .append("g")
+      .attr("transform", "translate(" + margin.left + "," + margin.top + ")");
+
+// Make sure that the info pop-up stays in its place even
+// if the canvas is scrolled horizontally
+// (this especially applies on touchscreens)
+$("div#tree div.grid div.table-responsive")
+   .scroll(function() {
+      var jqCircle = $("#info").data("circle");
+      if (jqCircle) {
+         var pos = jqCircle.offset();
+         $("#info")
+            .css("left", "" + pos.left + "px")
+            .css("top", "" + pos.top + "px")
+      }
+   });
+
+// Hovering over terminals
+
+function wrapTokenInfo(dd) {
+   // Convert token information from the JSON simplified format
+   // (created in canonicalize_token() in ReynirPackage/bintokenizer.py)
+   // to the complex format expected by tokenInfo()
+   var tv = dd.v;
+   if (dd.k == "AMOUNT")
+      tv = [ dd.v.amount, dd.v.currency ];
+   else
+   if (dd.k == "DATE" || dd.k == "DATEREL" || dd.k == "DATEABS")
+      tv = [ dd.v.y, dd.v.mo, dd.v.d ];
+   else
+   if (dd.k == "TIME")
+      tv = [ dd.v.h, dd.v.m, dd.v.s ];
+   else
+   if (dd.k == "TIMESTAMP" || dd.k == "TIMESTAMPABS" || dd.k == "TIMESTAMPREL")
+      tv = [ dd.v.y, dd.v.mo, dd.v.d, dd.v.h, dd.v.m, dd.v.s ];
+   else
+   if (dd.k == "PERCENT" || dd.k == "NUMBER" || dd.k == "CURRENCY")
+      tv = [ dd.v ];
+   else
+   if (dd.k == "MEASUREMENT")
+      tv = [ dd.v.unit, dd.v.value ];
+   else
+   if (dd.k == "PERSON")
+      tv = dd.s;
+   return tokenInfo(
+      {
+         k: tokId[dd.k],
+         // We use the full terminal variant set (dd.a) if available,
+         // otherwise the smaller (original) subset (dd.t)
+         t: dd.a || dd.t,
+         g: dd.g,
+         // stem, category (ordfl), fl, beyging
+         m: [ dd.s, dd.c, dd.f, dd.b ],
+         x: dd.x,
+         v: tv
+      }, null);
+}
+
+function terminalIn(d) {
+   // Get the circle object, even if we're hovering over an associated text
+   var circle = d3.select(this.parentNode).select("circle");
+   // Indicate that we're hovering
+   circle
+      .classed("hovering", true)
+      .attr("r", 11);
+
+   // Access the node data
+   var dd = circle.data()[0].data;
+   if (dd.k == "PUNCTUATION")
+      return;
+
+   var jqCircle = $(this).parent().children("circle");
+   var pos = jqCircle.offset();
+
+   r = wrapTokenInfo(dd);
+
+   $("#grammar").html(r.grammar || "");
+   $("#lemma").text(r.lemma || "");
+   $("#details").text(r.details || "");
+
+   // Display the percentage bar if we have percentage info
+   if (r.percent !== null)
+      makePercentGraph(r.percent);
+   else
+      $("#percent").css("display", "none");
+
+   // Set the class of the pop-up div
+   $("#info").removeClass();
+   if (r.class !== null)
+      $("#info").addClass(r.class);
+
+   // Set the class of the pop-up tag
+   $("#info span#tag")
+      .removeClass()
+      .addClass("glyphicon")
+      .addClass(r.tagClass ? r.tagClass : "glyphicon-tag");
+
+   // Position the info popup
+   $("#info")
+      .css("left", "" + pos.left + "px")
+      .css("top", "" + pos.top + "px")
+      .css("visibility", "visible")
+      .data("circle", jqCircle);
+}
+
+function terminalOut(d) {
+   var circle = d3.select(this.parentNode).select("circle");
+   circle.classed("hovering", false).attr("r", 10);
+   var dd = circle.data()[0].data;
+   if (dd.k == "PUNCTUATION")
+      return;
+   $("#info")
+      .css("visibility", "hidden")
+      .css("left", 0)
+      .css("top", 0)
+      .data("circle", null);
+}
+
+function d3_update(source) {
+   // Create the SVG graphics on the canvas via D3
+   var nodes = source.descendants();
+   var links = source.links();
+
+   // Precalculate the text for each node
+   nodes.forEach(function(d) {
+      d.data.text = d.data.n ? d.data.n : d.data.x;
+   });
+
+   // Compute the new tree layout using the D3 layout object
+   tree(source);
+
+   // Normalize the y coordinates
+   nodes.forEach(function(d) {
+      d.y = d.depth * 80;
+   });
+
+   // Declare the links
+   var link = g.selectAll(".link")
+      .data(links)
+      .enter().append("path")
+         .attr("class", "link")
+         .attr("d", function(d) {
+            // Define a cubic curve originating at the source
+            // and terminating at the target, with vertical
+            // exit and entry points from and to the nodes
+            return "M " + d.source.x + "," + d.source.y
+               + " C " + d.source.x + "," + (d.source.y + d.target.y) / 2
+               + " " + d.target.x + "," + (d.source.y + d.target.y) / 2
+               + " " + d.target.x + "," + d.target.y;
+         });
+
+   // Declare the nodes
+   var node = g.selectAll(".node")
+      .data(nodes)
+      .enter().append("g")
+         .attr("class", function(d) {
+            // Assign different classes to nonterminals vs. terminals
+            var classes = ["node"];
+            if (d.children) {
+               classes.push("node-nonterminal");
+               // Push the nonterminal identifier (P, S, NP, VP...)
+               classes.push(d.data.i);
+            }
+            else {
+               classes.push("node-terminal");
+               var firstPart = d.data.t ? d.data.t.split("_")[0] : undefined;
+               // Add a class name corresponding to the first part of the terminal name,
+               // if it is an interesting terminal type
+               if (d.data.k && d.data.k == "PUNCTUATION")
+                  classes.push("punct")
+               else
+               if (d.data.k && (d.data.k == "CURRENCY" || d.data.k == "AMOUNT"))
+                  classes.push("currency");
+               else
+               if (d.data.k && (d.data.k == "NUMBER" || d.data.k == "ORDINAL"))
+                  classes.push("number");
+               else
+               if (d.data.k && d.data.k == "PERCENT")
+                  classes.push("percent");
+               else
+               if (d.data.k && d.data.k == "MEASUREMENT")
+                  classes.push("measurement");
+               else
+               if (d.data.k && (d.data.k == "TIMESTAMP" || d.data.k == "TIMESTAMPABS" ||
+                  d.data.k == "TIMESTAMPREL"))
+                  classes.push("timestamp");
+               else
+               if (d.data.k && d.data.k == "TIME")
+                  classes.push("time");
+               else
+               if (d.data.k && (d.data.k == "DATE" || d.data.k == "DATEABS" || d.data.k == "DATEREL"))
+                  classes.push("date");
+               else
+               if (firstPart == "sérnafn" || firstPart == "entity")
+                  classes.push("entity");
+               else
+               if (firstPart == "person")
+                  classes.push("person-" + d.data.c);
+               else
+               if (firstPart == "ártal")
+                  classes.push("year")
+               else
+               if (d.data.c)
+                  // Add a class for the word category
+                  classes.push(d.data.c);
+            }
+            return classes.join(" ");
+         })
+         .attr("transform", function(d) { 
+            return "translate(" + d.x + "," + d.y + ")";
+         });
+
+   g.selectAll(".node-nonterminal")
+      .append("rect")
+         .attr("width", function(d) {
+            // Select one of three widths depending on the text length
+            return d.data.text.length < 11 ? 64 :
+               (d.data.text.length < 14 ? 80 :
+               (d.data.text.length < 20 ? 100 : 128));
+         })
+         .attr("height", 20)
+         .attr("transform", function(d) {
+            var w = parseInt(this.getAttribute("width"));
+            var h = parseInt(this.getAttribute("height"));
+            return "translate(" + (-w / 2) + "," + (-h / 2) + ")";
+         })
+         .attr("rx", 6)
+         .attr("ry", 6);
+
+   g.selectAll(".node-terminal")
+      .append("circle")
+         .attr("r", 10);
+
+   // Add a symbol on top of terminal circles
+   var DEFAULT_OFFSET = 6;
+   var symbolOffset = []; // Default y offset is 6 pixels
+   symbolOffset ["\uE004"] = 5; // user
+   symbolOffset ["%"] = 5; // percent sign
+   symbolOffset ["!"] = 5; // exclamation mark
+   symbolOffset ["?"] = 5; // question mark
+   symbolOffset ["\uE066"] = 7; // tag
+
+   [
+      ["person-kk", "\uE247"], // male
+      ["person-kvk", "\uE248"], // female
+      ["entity", "\uE066"], // tag
+      ["st", "\uE051"], // link
+      ["stt", "\uE051"], // link
+      ["nhm", "\uE212"], // right-arrow
+      ["fs", "\uE224"], // chevron-right
+      ["gr", "\uE174"], // play
+      ["so", "\uE242"], // flash
+      ["kk", "\uE176"], // stop
+      ["kvk", "\uE176"], // stop
+      ["hk", "\uE176"], // stop
+      ["fn", "\u002A"], // asterisk
+      ["pfn", "\uE004"], // user
+      ["abfn", "\uE176"], // stop
+      ["lo", "\uE518"], // options
+      ["year", "\uE055"], // clock
+      ["timestamp", "\uE055"], // clock
+      ["time", "\uE055"], // clock
+      ["date", "\uE055"], // clock
+      ["ao", "\uE049"], // star
+      ["eo", "\uE049"], // star
+      ["spao", "?"], // question mark
+      ["tao", "\uE055"], // clock
+      ["currency", "\u20AC"], // euro
+      ["number", "\uE319"], // more-items
+      ["to", "\uE319"], // more-items
+      ["töl", "\uE319"], // more-items
+      ["percent", "%"], // percent sign
+      ["measurement", "\uE332"], // dashboard
+      ["uh", "!"], // exclamation mark
+   ]
+   .forEach(function(d) {
+      g.selectAll(".node-terminal." + d[0])
+         .append("text")
+            .attr("class", "symbol")
+            .attr("text-anchor", "middle")
+            .attr("y", symbolOffset[d[1]] || DEFAULT_OFFSET)
+            .text(d[1])
+   });
+
+   node.append("text")
+      .attr("y", function(d) {
+         // Nonterminals have their legend above the center point;
+         // terminals have their legend below the center point
+         return (d.children || (d.data.k && d.data.k == "PUNCTUATION")) ? 0 : 22;
+      })
+      .attr("dy", ".35em")
+      .attr("text-anchor", "middle")
+      .text(function(d) {
+         // Return the precalculated text
+         return d.data.text;
+      });
+
+   // Put a hover handler on each terminal
+   g.selectAll(".node-terminal circle")
+      .on("mouseover", terminalIn)
+      .on("mouseout", terminalOut);
+   g.selectAll(".node-terminal text")
+      .on("mouseover", terminalIn)
+      .on("mouseout", terminalOut);
+}
+
+// Hold the text to be displayed
+
+var theText = {{ txt | tojson }};
+
+function editSentence() {
+   // Navigate to the analysis page with the text pre-set
+   window.location.href = "/analysis?txt=" + encodeURIComponent(theText);
+}
+
+function initMain(jQuery) {
+   // Initialization
+   $("#edit-sent").click(editSentence);
+   $("#info")
+      .click(function(ev) {
+         ev.stopPropagation();
+         $(this).css("visibility", "hidden");
+      })
+      .data("circle", null);
+
+   // Enable tabs
+   $('#tree-hdr a').click(function() {
+       $(this).tab('show');
+   });
+   $('#tree-hdr a:first').tab('show');
+   $('div#simple').css("visibility", "visible");
+
+   // Display tree using D3
+   if (root) {
+      d3.select(self.frameElement).style("height", (height + margin.top + margin.bottom) + "px");
+      d3_update(root);
+   }
+
+   // Set up panning of the tree display
+
+   var scrollable = false;
+   var captured = false;
+   var originX;
+   var scrollX;
+
+   $('#canvas svg')
+      .mousedown(function(e) {
+         e.preventDefault();
+         if (scrollable) {
+            originX = e.clientX;
+            scrollX = $("#canvas").parent().scrollLeft();
+            captured = true;
+         }
+      })
+      .mouseup(function(e) {
+         if (captured) {
+            e.preventDefault();
+            captured = false;
+         }
+      })
+      .mousemove(function(e) {
+         if (!captured)
+            return;
+         e.preventDefault();
+         $("#canvas").parent()
+            .scrollLeft(Math.max(0, scrollX + (originX - e.clientX)))
+      });
+   // If the browser window is resized, figure out whether the canvas
+   // is scrollable or not
+   var cursorSetter =
+      function(e) {
+         scrollable = $("#canvas svg").width() > $("#canvas-container").width();
+         $("#canvas svg").css("cursor", scrollable ? "ew-resize" : "default");
+      };
+   $(window).resize(cursorSetter);
+   cursorSetter();
+
+}
+
+$(document).ready(initMain);
+
+</script>
+
+{% endblock %}
+

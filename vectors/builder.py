@@ -3,9 +3,20 @@
 
     Document index builder & topic tagger module
 
-    Copyright (c) 2016 Vilhjalmur Thorsteinsson
-    All rights reserved
-    See the accompanying README.md file for further licensing and copyright information.
+    Copyright (C) 2016 Vilhjálmur Þorsteinsson
+
+       This program is free software: you can redistribute it and/or modify
+       it under the terms of the GNU General Public License as published by
+       the Free Software Foundation, either version 3 of the License, or
+       (at your option) any later version.
+       This program is distributed in the hope that it will be useful,
+       but WITHOUT ANY WARRANTY; without even the implied warranty of
+       MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+       GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see http://www.gnu.org/licenses/.
+    
 
     This module is written in Python 3
 
@@ -48,13 +59,19 @@ import getopt
 import json
 import time
 from datetime import datetime
-#import logging
-#logging.basicConfig(format='%(asctime)s : %(levelname)s : %(message)s', level=logging.INFO)
+from collections import defaultdict
 
-from settings import Settings, Topics
-from scraperdb import Article, Topic, ArticleTopic, Word, SessionContext
+from settings import Settings, Topics, NoIndexWords
+from scraperdb import Article, Topic, ArticleTopic, Word, SessionContext, TermTopicsQuery
+from similar import SimilarityClient
 
+import numpy as np
 from gensim import corpora, models, matutils
+
+
+def w_from_stem(stem, cat):
+    """ Convert a (stem, cat) tuple to a bag-of-words key """
+    return stem.lower().replace('-', "").replace(' ', '_') + "/" + cat
 
 
 class CorpusIterator:
@@ -74,8 +91,8 @@ class CorpusIterator:
             xform = lambda x: x
         with SessionContext(commit = True) as session:
             # Fetch bags of words sorted by articles
-            q = session.query(Words.article_id, Words.stem, Words.cat, Words.cnt) \
-                .order_by(Words.article_id).yield_per(2000)
+            q = session.query(Word.article_id, Word.stem, Word.cat, Word.cnt) \
+                .order_by(Word.article_id).yield_per(2000)
             bag = []
             last_uuid = None
             for uuid, stem, cat, cnt in q:
@@ -88,7 +105,7 @@ class CorpusIterator:
                     # Beginning a new article with an empty bag
                     last_uuid = uuid
                 # Convert stem to lowercase and replace spaces with underscores
-                w = stem.lower().replace(" ", "_") + "/" + cat
+                w = w_from_stem(stem, cat)
                 if cnt == 1:
                     bag.append(w)
                 else:
@@ -96,11 +113,27 @@ class CorpusIterator:
             if last_uuid is not None:
                 # print("Yielding bag of {0} words".format(len(bag)))
                 yield xform(bag)
+        print("Finished iteration through corpus from words table")
+
+
+class ReynirDictionary(corpora.Dictionary):
+
+    """ Subclass of gensim.corpora.Dictionary that adds a __contains__
+        operator for easy membership check """
+
+    def __init__(self, iterator):
+        super().__init__(iterator)
+
+    def __contains__(self, word):
+        return word in self.token2id
 
 
 class ReynirCorpus:
 
     """ Wraps the document indexing functionality """
+
+    # Default number of dimensions in topic vectors
+    _DEFAULT_DIMENSIONS = 200
 
     # Work file names
     _DICTIONARY_FILE = './models/reynir.dict'
@@ -110,33 +143,32 @@ class ReynirCorpus:
     _LSI_MODEL_FILE = './models/lsi-{0}.model'
     _LDA_MODEL_FILE = './models/lda-{0}.model'
 
-    def __init__(self, verbose = False):
+    def __init__(self, verbose = False, dimensions = None):
         self._verbose = verbose
         self._dictionary = None
         self._tfidf = None
         self._model = None
         self._model_name = None
         self._topics = None
+        self._dimensions = dimensions or ReynirCorpus._DEFAULT_DIMENSIONS
+
+    @property
+    def dimensions(self):
+        return self._dimensions
 
     def create_dictionary(self):
         """ Iterate through the article database
             and create a fresh Gensim dictionary """
         ci = CorpusIterator()
-        dic = corpora.Dictionary(ci)
-        if self._verbose:
-            print("Dictionary before filtering:")
-            print(dic)
+        dic = ReynirDictionary(ci)
         # Drop words that only occur only once or twice in the entire set
         dic.filter_extremes(no_below=3, keep_n=None)
-        if self._verbose:
-            print("Dictionary after filtering:")
-            print(dic)
         dic.save(self._DICTIONARY_FILE)
         self._dictionary = dic
 
     def load_dictionary(self):
         """ Load a dictionary from a previously prepared file """
-        self._dictionary = corpora.Dictionary.load(self._DICTIONARY_FILE)
+        self._dictionary = ReynirDictionary.load(self._DICTIONARY_FILE)
 
     def create_plain_corpus(self):
         """ Create a plain vector corpus, where each vector represents a
@@ -176,41 +208,41 @@ class ReynirCorpus:
         """ Load a TFIDF corpus from file """
         return corpora.MmCorpus(self._TFIDF_CORPUS_FILE)
 
-    def create_lsi_model(self, num_topics = 200, **kwargs):
+    def create_lsi_model(self, **kwargs):
         """ Create an LSI model from the entire words database table """
         corpus_tfidf = self.load_tfidf_corpus()
         if self._dictionary is None:
             self.load_dictionary()
         # Initialize an LSI transformation
-        lsi = models.LsiModel(corpus_tfidf, id2word=self._dictionary,
-            num_topics=num_topics, **kwargs)
-        if self._verbose:
-            lsi.print_topics(num_topics = num_topics)
+        lsi = models.LsiModel(corpus_tfidf, id2word = self._dictionary,
+            num_topics = self._dimensions, **kwargs)
+        # if self._verbose:
+        #    lsi.print_topics(num_topics = self._dimensions)
         # Save the generated model
-        lsi.save(self._LSI_MODEL_FILE.format(num_topics))
+        lsi.save(self._LSI_MODEL_FILE.format(self._dimensions))
 
-    def load_lsi_model(self, num_topics = 200):
+    def load_lsi_model(self):
         """ Load a previously generated LSI model """
-        self._model = models.LsiModel.load(self._LSI_MODEL_FILE.format(num_topics), mmap='r')
+        self._model = models.LsiModel.load(self._LSI_MODEL_FILE.format(self._dimensions), mmap='r')
         self._model_name = "lsi"
 
-    def create_lda_model(self, num_topics = 200, **kwargs):
+    def create_lda_model(self, **kwargs):
         """ Create a Latent Dirichlet Allocation (LDA) model from the
             entire words database table """
         corpus_tfidf = self.load_tfidf_corpus()
         if self._dictionary is None:
             self.load_dictionary()
         # Initialize an LDA transformation
-        lda = models.LdaMulticore(corpus_tfidf, id2word=self._dictionary,
-            num_topics=num_topics, **kwargs)
+        lda = models.LdaMulticore(corpus_tfidf, id2word = self._dictionary,
+            num_topics = self._dimensions, **kwargs)
         if self._verbose:
-            lda.print_topics(num_topics = num_topics)
+            lda.print_topics(num_topics = self._dimensions)
         # Save the generated model
-        lda.save(self._LDA_MODEL_FILE.format(num_topics))
+        lda.save(self._LDA_MODEL_FILE.format(self._dimensions))
 
-    def load_lda_model(self, num_topics = 200):
+    def load_lda_model(self):
         """ Load a previously generated LDA model """
-        self._model = models.LdaMulticore.load(self._LDA_MODEL_FILE.format(num_topics), mmap='r')
+        self._model = models.LdaMulticore.load(self._LDA_MODEL_FILE.format(self._dimensions), mmap='r')
         self._model_name = "lda"
 
     def calculate_topics(self):
@@ -231,6 +263,10 @@ class ReynirCorpus:
                     # Overwrite the existing keywords
                     keywords = list(Topics.DICT[topic.name]) # Convert set to list
                     topic.keywords = " ".join(keywords)
+                    # Set the identifier
+                    topic.identifier = Topics.ID[topic.name]
+                    # Set the threshold
+                    topic.threshold = Topics.THRESHOLD[topic.name]
                 else:
                     # Use the ones that are already there
                     keywords = topic.keywords.split()
@@ -238,11 +274,7 @@ class ReynirCorpus:
                 if self._verbose:
                     print("Keyword list: {0}".format(keywords))
                 bag = self._dictionary.doc2bow(keywords)
-                #if self._verbose:
-                #    print("Bag: {0}".format(bag))
                 tfidf = self._tfidf[bag]
-                #if self._verbose:
-                #    print("Tfidf: {0}".format(tfidf))
                 vec = self._model[tfidf]
                 if self._verbose:
                     if self._model_name == "lda":
@@ -271,14 +303,145 @@ class ReynirCorpus:
                         self._topics[topic.id] = dict(name = topic.name,
                             vector = topic_vector, threshold = topic.threshold)
 
-    def assign_article_topics(self, article_id, heading):
+    def get_topic_vector(self, terms):
+        """ Calculate a topic vector corresponding to the given list
+            of search terms, which are assumed to have the form (stem, category).
+            Return the topic vector as well as a list of weights of
+            each search term """
+        if self._dictionary is None:
+            self.load_dictionary()
+        if self._tfidf is None:
+            self.load_tfidf_model()
+        if self._model is None:
+            self.load_lsi_model()
+        # Convert the word list, assumed to contain items of the form 'stem/cat',
+        # to a bag of word indexes
+        wlist = [ w_from_stem(stem, cat) for stem, cat in terms ]
+        bag = self._dictionary.doc2bow(wlist)
+        print("Search terms:\n   {0}".format(terms))
+        if bag:
+            # We have some terms in the bag (i.e. they were in the dictionary)
+            # Apply the term frequency - inverse document frequency transform
+            tfidf = self._tfidf[bag]
+            # Map the resulting vector to the LSI model space
+            topic_vector = np.array([ float(x) for _, x in self._model[tfidf] ])
+        else:
+            # No bag, we're just going to use word occurrences
+            topic_vector = np.zeros(self._dimensions)
+        # For words that we want to look up from the words table, calculate a
+        # weighted average of the topic vectors of documents where those
+        # words appear
+        missing = np.zeros(self._dimensions)
+        weight_missing = 0.0
+        lb = len(bag)
+        term_weights = []
+
+        # We have missing words: look'em up
+        with SessionContext(commit = True, read_only = True) as session:
+            # The same (stem, cat) tuple may appear multiple times:
+            # coalesce into one counting dictionary
+
+            for index, (stem, cat) in enumerate(terms):
+
+                def word_lookup_weight(stem, cat):
+                    """ Does this term call for a lookup in the words database table? """
+                    if cat == "entity" or cat.startswith("person"):
+                        # We look up all entity and person names
+                        # and give them extra weight
+                        return 2.0
+                    if cat in { "kk", "kvk", "hk" } and stem[0].isupper() and index > 0:
+                        # Noun starting with a capital letter, not the first word in a sentence:
+                        # assume it's a proper name and do a lookup with a weight of 1.6
+                        return 1.6
+                    w = w_from_stem(stem, cat)
+                    if isinstance(self._dictionary, ReynirDictionary):
+                        in_dict = w in self._dictionary
+                    else:
+                        # !!! TODO: This else-branch can be removed once a new
+                        # !!! ReynirDictionary has been built and pickled
+                        in_dict = w in self._dictionary.token2id
+                    # Without further reason, we don't look up terms that already
+                    # exist in the LSI model dictionary. For other terms, they
+                    # appear to be rare and we give them a slight overweight if
+                    # they are found in the words table.
+                    return 0.0 if in_dict else 1.2
+
+                weight = word_lookup_weight(stem, cat)
+
+                if weight == 0.0:
+                    # If weight is 0.0, we don't need to bother
+                    # (This means that the word is in the LSI model dictionary
+                    # and not special in any way. From the overall search term
+                    # point of view, we give it a weight of 1.0)
+                    term_weights.append(1.0)
+                    continue
+
+                if cat in NoIndexWords.CATEGORIES_TO_INDEX \
+                    and (stem, cat) not in NoIndexWords.SET:
+                    # We have a significant (potentially indexable)
+                    # person, entity, noun, adjective or verb. Give it
+                    # a weight in the final topic vector.
+
+                    def clean(stem):
+                        """ Eliminate composite word hyphens from the stem """
+                        if "- og " in stem or "- eða " in stem:
+                            # Leave 'iðnaðar- og viðskiptaráðuneyti' alone
+                            return stem
+                        # We want to keep other types of hyphens (surrounded by spaces)
+                        # such as 'Vestur - Íslendingar'
+                        a = stem.split(" - ")
+                        return " - ".join(p.replace("-", "") for p in a)
+
+                    clean_stem = clean(stem)
+                    q = TermTopicsQuery().execute(session, stem = clean_stem, cat = cat, limit = 25)
+                    term_vector = np.zeros(self._dimensions)
+                    total_cnt = 0
+                    # Sum up the topic vectors of the documents where the term
+                    # appears, weighted by the number of times it appears
+                    # print("Found stem/cat '{0}'/{1} in {2} documents via words table".format(clean_stem, cat, len(q)))
+                    for tv_json, cnt in q:
+                        # Get the term vector of a single document where the term appears
+                        if tv_json and cnt:
+                            tv = np.array(json.loads(tv_json))
+                            # Multiply the vector by the number of times the term appears
+                            total_cnt += cnt
+                            term_vector += tv * cnt
+                    # Add the combined (weighted average) topic vector of the
+                    # term to the 'missing' topic vector
+                    if total_cnt > 0:
+                        missing += (term_vector / total_cnt) * weight
+                        # Keep track of how many 'missing' terms have contributed
+                        # to the missing term vector
+                        weight_missing += weight
+                        term_weights.append(weight)
+                    else:
+                        # Not found in the words table: this term contributes nothing
+                        term_weights.append(0.0)
+                else:
+                    # print("Discarding term {0} (weight {1:.1f})".format(w_from_stem(stem, cat), weight))
+                    term_weights.append(0.0)
+
+        assert len(terms) == len(term_weights)
+
+        if weight_missing > 0.0:
+            # Adjust the weight of the returned topic vector so that the missing
+            # terms have a contribution that corresponds to their number
+            p_tv = lb / (lb + weight_missing)
+            # Calculate the relative contribution of the missing terms
+            p_m = 1.0 - p_tv
+            # Amalgamate the resulting topic vector
+            topic_vector = topic_vector * p_tv + missing * p_m
+
+        return topic_vector, term_weights
+
+    def assign_article_topics(self, article_id, heading, process_all = False):
         """ Assign the appropriate topics to the given article in the database """
         if self._dictionary is None:
             self.load_dictionary()
         if self._tfidf is None:
             self.load_tfidf_model()
         if self._model is None:
-            self.load_lda_model()
+            self.load_lsi_model()
         if self._topics is None:
             self.load_topics()
         with SessionContext(commit = True) as session:
@@ -287,12 +450,13 @@ class ReynirCorpus:
             wlist = []
             for stem, cat, cnt in q:
                 # Convert stem to lowercase and replace spaces with underscores
-                w = stem.lower().replace(" ", "_") + "/" + cat
+                w = w_from_stem(stem, cat)
                 if cnt == 1:
                     wlist.append(w)
                 else:
                     wlist.extend([w] * cnt)
             topics = []
+            article_vector = []
             if self._topics and wlist:
                 bag = self._dictionary.doc2bow(wlist)
                 tfidf = self._tfidf[bag]
@@ -304,7 +468,7 @@ class ReynirCorpus:
                     topic_name = topic_info["name"]
                     topic_vector = topic_info["vector"]
                     topic_threshold = topic_info["threshold"]
-                    # Calculate the cosine similarity betwee the article and the topic
+                    # Calculate the cosine similarity between the article and the topic
                     similarity = matutils.cossim(article_vector, topic_vector)
                     if self._verbose:
                         print("   Similarity to topic {0} is {1:.3f}".format(topic_name, similarity))
@@ -312,33 +476,43 @@ class ReynirCorpus:
                         # Similar enough: this is a topic of the article
                         topics.append(topic_id)
                         topic_names.append((topic_name, similarity))
-                if topic_names:
-                    print("Article '{0}': topics {1}".format(heading, topic_names))
+                if topic_names and not process_all:
+                    print("Article '{0}':\n   topics {1}".format(heading, topic_names))
             # Topics found (if any): delete previous ones (if any)
             session.execute(ArticleTopic.table().delete().where(ArticleTopic.article_id == article_id))
             # ...and add the new ones
             for topic_id in topics:
                 session.add(ArticleTopic(article_id = article_id, topic_id = topic_id))
-            # Update the indexed timestamp
+            # Update the indexed timestamp and the article topic vector
             a = session.query(Article).filter(Article.id == article_id).one_or_none()
-            if a:
+            if a is not None:
                 a.indexed = datetime.utcnow()
+                if article_vector:
+                    # Store a pure list of floats
+                    topic_vector = [ t[1] for t in article_vector ]
+                    a.topic_vector = json.dumps(topic_vector)
+                else:
+                    a.topic_vector = None
 
-    def assign_topics(self, limit = None, process_all = False):
+    def assign_topics(self, limit = None, process_all = False, uuid = None):
         """ Assign topics to all articles that have no such assignment yet """
         with SessionContext(commit = True) as session:
             # Fetch articles that haven't been indexed (or have been parsed since),
             # and that have at least one associated Word in the words table.
             q = session.query(Article.id, Article.heading)
-            if not process_all:
+            if uuid:
+                q = q.filter(Article.id == uuid)
+            elif not process_all:
                 q = q.filter((Article.indexed == None) | (Article.indexed < Article.parsed))
             q = q.join(Word).group_by(Article.id, Article.heading)
-            if process_all or limit is None:
+            if uuid:
                 q = q.all()
+            elif limit is None:
+                q = q.yield_per(2000)
             else:
                 q = q[0:limit]
         for article_id, heading in q:
-            self.assign_article_topics(article_id, heading)
+            self.assign_article_topics(article_id, heading, process_all = process_all)
 
 
 def build_model(verbose = False):
@@ -351,11 +525,16 @@ def build_model(verbose = False):
     t0 = time.time()
 
     rc = ReynirCorpus(verbose = verbose)
+    print("Creating dictionary")
     rc.create_dictionary()
+    print("Creating plain corpus")
     rc.create_plain_corpus()
+    print("Creating TF-IDF model")
     rc.create_tfidf_model()
+    print("Creating TF-IDF corpus")
     rc.create_tfidf_corpus()
     #rc.create_lda_model(passes = 15)
+    print("Creating LSI model")
     rc.create_lsi_model()
 
     t1 = time.time()
@@ -376,12 +555,14 @@ def calculate_topics(verbose = False):
     print("------ Reynir recalculation complete -------")
 
 
-def tag_articles(limit, verbose = False, process_all = False):
+def tag_articles(limit, verbose = False, process_all = False, uuid = None):
     """ Tag all untagged articles or articles that
         have been parsed since they were tagged """
 
     print("------ Reynir starting tagging -------")
-    if process_all:
+    if uuid:
+        print("Tagging article {0}".format(uuid))
+    elif process_all:
         print("Processing all articles")
     elif limit:
         print("Limit: {0} articles".format(limit))
@@ -392,7 +573,7 @@ def tag_articles(limit, verbose = False, process_all = False):
 
     rc = ReynirCorpus(verbose = verbose)
     rc.load_lsi_model()
-    rc.assign_topics(limit, process_all)
+    rc.assign_topics(limit, process_all, uuid)
 
     t1 = time.time()
 
@@ -400,6 +581,16 @@ def tag_articles(limit, verbose = False, process_all = False):
     print("Total time: {0:.2f} seconds".format(t1 - t0))
     ts = "{0}".format(datetime.utcnow())[0:19]
     print("Time: {0}\n".format(ts))
+
+
+def notify_similarity_server():
+    """ Notify the similarity server - if running - that article tags have been updated """
+    try:
+        client = SimilarityClient()
+        client.refresh_topics()
+        client.close()
+    except Exception as e:
+        print("Exception in notify_similarity_server(): {0}".format(e))
 
 
 class Usage(Exception):
@@ -415,17 +606,18 @@ __doc__ = """
     Index builder and tagger module
 
     Usage:
-        python builder.py [options] command
+        python builder.py [options] command [arguments]
 
     Options:
         -h, --help       : Show this help text
         -l N, --limit=N  : Limit processing to N articles
         -a, --all        : Process all articles
+        -v, --verbose    : Show diagnostics while processing
 
     Commands:
-        tag     : tag any untagged articles
-        topics  : recalculate topic vectors from keywords
-        model   : rebuild dictionary and model from parsed articles
+        tag [uuid] : tag any untagged articles (or the article with the given uuid)
+        topics     : recalculate topic vectors from keywords
+        model      : rebuild dictionary and model from parsed articles
 
 """
 
@@ -436,8 +628,8 @@ def _main(argv = None):
         argv = sys.argv
     try:
         try:
-            opts, args = getopt.getopt(argv[1:], "hl:va",
-                ["help", "limit=", "verbose", "all"])
+            opts, args = getopt.getopt(argv[1:], "hl:van",
+                ["help", "limit=", "verbose", "all", "notify"])
         except getopt.error as msg:
              raise Usage(msg)
 
@@ -445,6 +637,7 @@ def _main(argv = None):
         limit = 10
         verbose = False
         process_all = False
+        notify = False
 
         # Process options
         for o, a in opts:
@@ -462,31 +655,48 @@ def _main(argv = None):
                 verbose = True
             elif o in ("-a", "--all"):
                 process_all = True
+            elif o in ("-n", "--notify"):
+                notify = True
 
-        if process_all and limit_specified:
-            raise Usage("--all and --limit cannot be used together")
+        #if process_all and limit_specified:
+        #    raise Usage("--all and --limit cannot be used together")
 
         Settings.read("Vectors.conf")
 
         # Process arguments
-        for arg in args:
-            if arg == "tag":
-                # Tag articles
-                tag_articles(limit = limit, verbose = verbose, process_all = process_all)
-                break
-            elif arg == "topics":
-                # Calculate topics
-                calculate_topics(verbose = verbose)
-                break
-            elif arg == "model":
-                # Rebuild model
-                build_model(verbose = verbose)
-                break
-            else:
-                raise Usage("Unknown command: '{0}'".format(arg))
-        else:
-            # Nothing matched, no break in loop
+        if not args:
             raise Usage("No command specified")
+
+        la = len(args)
+        arg = args[0]
+        if arg == "tag":
+            # Tag articles
+            uuid = args[1] if la > 1 else None
+            if la > (1 if uuid is None else 2):
+                raise Usage("Too many arguments")
+            if uuid:
+                if process_all:
+                    raise Usage("Conflict between uuid argument and --all option")
+                if limit_specified:
+                    raise Usage("Conflict between uuid argument and --limit option")
+            if process_all and not limit_specified:
+                limit = None
+            tag_articles(limit = limit, verbose = verbose, process_all = process_all, uuid = uuid)
+            if notify:
+                # Inform the similarity server that we have new article tags
+                notify_similarity_server()
+        elif arg == "topics":
+            # Calculate topics
+            if la > 1:
+                raise Usage("Too many arguments")
+            calculate_topics(verbose = verbose)
+        elif arg == "model":
+            # Rebuild model
+            if la > 1:
+                raise Usage("Too many arguments")
+            build_model(verbose = verbose)
+        else:
+            raise Usage("Unknown command: '{0}'".format(arg))
 
     except Usage as err:
         print(err.msg, file = sys.stderr)

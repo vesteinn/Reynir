@@ -1,5 +1,6 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *.o
 *.so
@@ -11,38 +12,64 @@ __pycache__/
 # Pickled DAWG trees
 *.pickle
 
+# ngram models
+ngram*.txt
+
+# Training data files
+*.pairs
+*.tgz
+*.zip
+*.tsv
+
 # Experimental Python stuff
 rnn.py
 sudoku.py
 locktest.py
 ssltest.py
+test.py
+utils/reykjanes.py
 
 # Utility stuff
 diskuse.sh
+go.sh
+goss.sh
+parse.sh
+process.sh
+makezip.sh
 
 # Various resource files
 resources/*.txt
+!resources/ordalisti.sorted.txt
+!resources/obeygd.hreinsad.txt
 resources/*.csv
-resources/*.tmLanguage
+resources/ord.compressed
+#resources/*.tmLanguage
 resources/visir/
 resources/reykjanes/
 mim/
+ifd/
 gold/
 fonts/
+logs/
 .idea/
 node_modules/
 cffi_test/
 backup/
 
 # Vectors directory
+vectors/resources/
 vectors/bz2.py
 vectors/gensim-0.13.2/
 vectors/numpy-1.11.1/
 vectors/models/
-vectors/scraperdb.py
-vectors/settings.py
 vectors/t
 vectors/test.py
+
+# Files that are symlinked into the vectors directory
+vectors/scraperdb.py
+vectors/settings.py
+vectors/similar.py
+vectors/Index.conf
 
 # Minified JavaScript
 static/*.min.js
@@ -58,6 +85,7 @@ txt
 UnknownVerbs.txt
 parse.txt
 reduce.txt
+reduce-dup.txt
 input.txt
 nohup.out
 
@@ -82,9 +110,10 @@ console/
 
 # Virtual environments
 venv/
-pp/
-p3/
-p33/
+p35/
+p358/
+p359/
+p3510/
 
 # Installer logs
 pip-log.txt
@@ -106,3 +135,7 @@ $RECYCLE.BIN/
 *.msi
 *.msm
 *.msp
+
+# Google API key
+resources/GoogleServerKey.txt
+
